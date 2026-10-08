@@ -250,7 +250,7 @@ class MainActivity : Activity() {
         } else {
             val want = if (record) CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO
             else CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-            val modes = chars?.get(CameraCharacteristics.CONTROL_AVAILABLE_AF_MODES)
+            val modes = chars?.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
             if (modes != null && modes.contains(want)) {
                 b.set(CaptureRequest.CONTROL_AF_MODE, want)
             }
