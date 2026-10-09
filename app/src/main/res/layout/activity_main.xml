@@ -30,6 +30,12 @@
             android:text="Фото" />
 
         <Button
+            android:id="@+id/btnStack"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Долгая" />
+
+        <Button
             android:id="@+id/btnRec"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
@@ -134,7 +140,46 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:max="1000"
-                android:progress="800" />
+                android:progress="200" />
+
+            <TextView
+                android:id="@+id/tvBoost"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Цифровое усиление"
+                android:textColor="#FFFFFF"
+                android:visibility="gone" />
+
+            <SeekBar
+                android:id="@+id/sbBoost"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="1000"
+                android:progress="0"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tvStack"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Долгая выдержка"
+                android:textColor="#FFFFFF" />
+
+            <SeekBar
+                android:id="@+id/sbStack"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="118"
+                android:progress="28" />
+
+            <CheckBox
+                android:id="@+id/cbStackSum"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:buttonTint="#FFFFFF"
+                android:checked="true"
+                android:text="Суммировать (ярче); выкл. = среднее"
+                android:textColor="#FFFFFF" />
         </LinearLayout>
     </ScrollView>
 

@@ -12,11 +12,14 @@ import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
+import android.graphics.YuvImage
 import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.CamcorderProfile
+import android.media.ExifInterface
+import android.media.Image
 import android.media.ImageReader
 import android.media.MediaRecorder
 import android.os.Build
@@ -39,6 +42,7 @@ import android.widget.EditText
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
+import java.io.ByteArrayOutputStream
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
@@ -80,6 +84,32 @@ class MainActivity : Activity() {
     private var maxZoom: Float = 1f
     private var streamMap: StreamConfigurationMap? = null
     private var aspectMode = 0
+    private var boostRange: Range<Int>? = null
+    private var maxFrameDuration: Long = Long.MAX_VALUE
+    private lateinit var btnStack: Button
+    private lateinit var sbStack: SeekBar
+    private lateinit var tvStack: TextView
+    private lateinit var cbStackSum: CheckBox
+    private lateinit var sbBoost: SeekBar
+    private lateinit var tvBoost: TextView
+
+    // долгая выдержка (наложение кадров)
+    @Volatile private var stacking = false
+    @Volatile private var stackCancel = false
+    private var stackReader: ImageReader? = null
+    private var stackSurface: Surface? = null
+    private var stackCount = 0
+    private var stackTarget = 0
+    private var stackSum = true
+    private var stackW = 0
+    private var stackH = 0
+    private var yAcc: IntArray? = null
+    private var uAcc: IntArray? = null
+    private var vAcc: IntArray? = null
+    private val lin = IntArray(256) { Math.pow(it / 255.0, 2.2).times(65535.0).toInt() }
+    private val invLut = IntArray(16384) {
+        Math.pow(min(it * 4, 65535) / 65535.0, 1.0 / 2.2).times(255.0).toInt()
+    }
     private var videoCandidates: List<Size> = emptyList()
     private lateinit var panel: View
     private lateinit var btnPanel: Button
@@ -122,6 +152,12 @@ class MainActivity : Activity() {
         panel = findViewById(R.id.panel)
         btnPanel = findViewById(R.id.btnPanel)
         sbZoom = findViewById(R.id.sbZoom)
+        btnStack = findViewById(R.id.btnStack)
+        sbStack = findViewById(R.id.sbStack)
+        tvStack = findViewById(R.id.tvStack)
+        cbStackSum = findViewById(R.id.cbStackSum)
+        sbBoost = findViewById(R.id.sbBoost)
+        tvBoost = findViewById(R.id.tvBoost)
         tvZoom = findViewById(R.id.tvZoom)
         thread = HandlerThread("cam").also { it.start() }
         handler = Handler(thread.looper)
@@ -129,7 +165,10 @@ class MainActivity : Activity() {
         // восстановить сохранённые настройки
         sbIso.progress = prefs.getInt("iso", 200)
         sbExp.progress = prefs.getInt("exp", 500)
-        sbFocus.progress = prefs.getInt("focus", 800)
+        sbFocus.progress = prefs.getInt("focus", 200)
+        sbStack.progress = prefs.getInt("stack", 28)
+        cbStackSum.isChecked = prefs.getBoolean("stackSum", true)
+        sbBoost.progress = prefs.getInt("boost", 0)
         cbExp.isChecked = prefs.getBoolean("manExp", false)
         cbFocus.isChecked = prefs.getBoolean("manFocus", false)
         cbFlip.isChecked = prefs.getBoolean("flip", false)
@@ -170,6 +209,10 @@ class MainActivity : Activity() {
         sbExp.setOnSeekBarChangeListener(seekListener)
         sbFocus.setOnSeekBarChangeListener(seekListener)
         sbZoom.setOnSeekBarChangeListener(seekListener)
+        sbStack.setOnSeekBarChangeListener(seekListener)
+        sbBoost.setOnSeekBarChangeListener(seekListener)
+        btnStack.setOnClickListener { startStack() }
+        cbStackSum.setOnCheckedChangeListener { _, _ -> savePrefs() }
         btnAspect.setOnClickListener { toggleAspect() }
         btnPanel.setOnClickListener {
             panel.visibility = if (panel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
@@ -196,6 +239,9 @@ class MainActivity : Activity() {
             .putBoolean("manFocus", cbFocus.isChecked)
             .putBoolean("flip", cbFlip.isChecked)
             .putInt("zoom", sbZoom.progress)
+            .putInt("stack", sbStack.progress)
+            .putBoolean("stackSum", cbStackSum.isChecked)
+            .putInt("boost", sbBoost.progress)
             .putInt("aspect", aspectMode)
             .apply()
     }
@@ -217,11 +263,16 @@ class MainActivity : Activity() {
     private fun currentExp(): Long {
         val r = expRange ?: return 10_000_000L
         val lo = r.lower.toDouble()
-        val hi = min(r.upper, 66_666_666L).toDouble()
+        val hi = max(min(r.upper, maxFrameDuration), r.lower + 1).toDouble()
         return (lo * (hi / lo).pow(sbExp.progress / 1000.0)).toLong()
     }
 
-    private fun currentFocus(): Float = sbFocus.progress / 1000f * minFocus
+    private fun currentBoost(): Int {
+        val r = boostRange ?: return 100
+        return (r.lower + (r.upper - r.lower) * (sbBoost.progress / 1000.0)).toInt()
+    }
+
+    private fun currentFocus(): Float = (1f - sbFocus.progress / 1000f) * minFocus
 
     private fun currentZoom(): Float =
         maxZoom.toDouble().pow(sbZoom.progress / 1000.0).toFloat()
@@ -231,7 +282,15 @@ class MainActivity : Activity() {
     private fun updateLabels() {
         tvIso.text = "ISO: " + currentIso()
         val exp = currentExp()
-        tvExp.text = "Выдержка: 1/" + (1_000_000_000.0 / exp).toInt() + " с"
+        tvExp.text = if (exp >= 300_000_000L) String.format("Выдержка: %.2f с", exp / 1e9)
+        else "Выдержка: 1/" + (1_000_000_000.0 / exp).toInt() + " с"
+        val total = sbStack.progress + 2
+        val frames = min(300L, max(1L, total * 1_000_000_000L / exp))
+        tvStack.text = "Долгая выдержка: " + total + " с (кадров: " + frames + ")"
+        val br = boostRange
+        if (br != null && br.upper > 100) {
+            tvBoost.text = "Цифровое усиление: " + currentBoost() + "% (ISO ≈ " + (currentIso() * currentBoost() / 100) + ")"
+        }
         val f = currentFocus()
         val dist = if (f < 0.01f) "бесконечность" else String.format("%.1f см", 100f / f)
         tvFocus.text = String.format("Фокус: %.1f дптр (%s)", f, dist)
@@ -264,6 +323,10 @@ class MainActivity : Activity() {
             b.set(CaptureRequest.SENSOR_SENSITIVITY, currentIso())
             b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exp)
             b.set(CaptureRequest.SENSOR_FRAME_DURATION, max(exp, 33_333_333L))
+            val br = boostRange
+            if (br != null && br.upper > 100) {
+                b.set(CaptureRequest.CONTROL_POST_RAW_SENSITIVITY_BOOST, currentBoost())
+            }
         } else {
             b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
         }
@@ -310,6 +373,8 @@ class MainActivity : Activity() {
         minFocus = 0f
         maxZoom = 1f
         streamMap = null
+        boostRange = null
+        maxFrameDuration = Long.MAX_VALUE
         try {
             val c = cm.getCameraCharacteristics(id)
             chars = c
@@ -317,6 +382,9 @@ class MainActivity : Activity() {
             expRange = c.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
             minFocus = c.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
             log("ISO $isoRange, выдержка $expRange нс, мин. фокус $minFocus дптр")
+            maxFrameDuration = c.get(CameraCharacteristics.SENSOR_INFO_MAX_FRAME_DURATION) ?: Long.MAX_VALUE
+            boostRange = c.get(CameraCharacteristics.CONTROL_POST_RAW_SENSITIVITY_BOOST_RANGE)
+            log("Цифровое усиление (post-RAW boost): $boostRange; макс. длительность кадра $maxFrameDuration нс")
 
             val rr = if (Build.VERSION.SDK_INT >= 30)
                 c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) else null
@@ -328,7 +396,13 @@ class MainActivity : Activity() {
         } catch (e: Exception) {
             log("Характеристики недоступны: $e")
         }
-        runOnUiThread { updateLabels() }
+        runOnUiThread {
+            val br = boostRange
+            val show = if (br != null && br.upper > 100) View.VISIBLE else View.GONE
+            tvBoost.visibility = show
+            sbBoost.visibility = show
+            updateLabels()
+        }
     }
 
     private fun sizesFor(sizes: Array<Size>?): List<Size> {
@@ -415,7 +489,7 @@ class MainActivity : Activity() {
     }
 
     private fun toggleAspect() {
-        if (recording) { log("Сначала остановите запись"); return }
+        if (recording || stacking) { log("Сначала остановите запись или долгую выдержку"); return }
         aspectMode = (aspectMode + 1) % 3
         btnAspect.text = aspectLabel()
         savePrefs()
@@ -516,6 +590,7 @@ class MainActivity : Activity() {
         val reader = imageReader
         if (cam == null || s == null || reader == null) { log("Сначала откройте камеру"); return }
         if (recording) { log("Во время записи фото недоступно"); return }
+        if (stacking) { log("Идёт долгая выдержка"); return }
         try {
             val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             b.addTarget(reader.surface)
@@ -542,7 +617,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun savePhoto(bytes: ByteArray) {
+    private fun savePhoto(bytes: ByteArray, rotation: Int = -1) {
         try {
             val values = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, "macro_" + System.currentTimeMillis() + ".jpg")
@@ -552,10 +627,239 @@ class MainActivity : Activity() {
             val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
             if (uri == null) { log("Не удалось создать файл фото"); return }
             contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+            if (rotation >= 0) {
+                val rw = contentResolver.openFileDescriptor(uri, "rw")
+                if (rw != null) {
+                    rw.use {
+                        val exif = ExifInterface(it.fileDescriptor)
+                        val o = when (rotation) {
+                            90 -> ExifInterface.ORIENTATION_ROTATE_90
+                            180 -> ExifInterface.ORIENTATION_ROTATE_180
+                            270 -> ExifInterface.ORIENTATION_ROTATE_270
+                            else -> ExifInterface.ORIENTATION_NORMAL
+                        }
+                        exif.setAttribute(ExifInterface.TAG_ORIENTATION, o.toString())
+                        exif.saveAttributes()
+                    }
+                }
+            }
             log("Фото сохранено: Pictures/MacroCam")
         } catch (e: Exception) {
             log("Ошибка сохранения фото: $e")
         }
+    }
+
+    // ---------- долгая выдержка (наложение кадров) ----------
+
+    private fun cleanupStack() {
+        try { session?.close() } catch (_: Exception) {}
+        session = null
+        try { stackReader?.close() } catch (_: Exception) {}
+        stackReader = null
+        stackSurface = null
+        yAcc = null
+        uAcc = null
+        vAcc = null
+        runOnUiThread { btnStack.text = "Долгая" }
+    }
+
+    private fun startStack() {
+        if (stacking) {
+            stackCancel = true
+            log("Останавливаю, обработаю уже снятые кадры...")
+            return
+        }
+        val cam = device
+        if (cam == null) { log("Сначала откройте камеру"); return }
+        if (recording) { log("Остановите запись"); return }
+        if (!cbExp.isChecked || isoRange == null || expRange == null) {
+            log("Включите «Ручные ISO и выдержка» и задайте выдержку одного кадра")
+            return
+        }
+        val exp = currentExp()
+        val totalNs = (sbStack.progress + 2) * 1_000_000_000L
+        var n = (totalNs / exp).toInt()
+        if (n < 1) n = 1
+        if (n > 300) { n = 300; log("Кадров слишком много, ограничено до 300") }
+        stackW = photoSize.width
+        stackH = photoSize.height
+        try {
+            yAcc = IntArray(stackW * stackH)
+            uAcc = IntArray((stackW / 2) * (stackH / 2))
+            vAcc = IntArray((stackW / 2) * (stackH / 2))
+        } catch (e: OutOfMemoryError) {
+            yAcc = null; uAcc = null; vAcc = null
+            log("Не хватает памяти")
+            return
+        }
+        stackTarget = n
+        stackCount = 0
+        stackCancel = false
+        stackSum = cbStackSum.isChecked
+        try {
+            val reader = ImageReader.newInstance(stackW, stackH, ImageFormat.YUV_420_888, 3)
+            reader.setOnImageAvailableListener({ r -> onStackImage(r) }, handler)
+            stackReader = reader
+            stacking = true
+            runOnUiThread { btnStack.text = "Стоп 0/$n" }
+
+            try { session?.close() } catch (_: Exception) {}
+            session = null
+            val st = texture.surfaceTexture!!
+            st.setDefaultBufferSize(previewSize.width, previewSize.height)
+            val pSurface = Surface(st)
+            stackSurface = pSurface
+            val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            b.addTarget(pSurface)
+            applyControls(b, false)
+            builder = b
+            cam.createCaptureSession(listOf(pSurface, reader.surface), object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(s: CameraCaptureSession) {
+                    session = s
+                    log("Долгая выдержка: $n кадров, режим " + (if (stackSum) "сумма" else "среднее"))
+                    captureStackFrame()
+                }
+                override fun onConfigureFailed(s: CameraCaptureSession) {
+                    log("Сессия не настроилась")
+                    stacking = false
+                    cleanupStack()
+                    startPreview()
+                }
+            }, handler)
+        } catch (e: Exception) {
+            log("Ошибка запуска долгой выдержки: $e")
+            stacking = false
+            cleanupStack()
+            startPreview()
+        }
+    }
+
+    private fun captureStackFrame() {
+        val cam = device
+        val s = session
+        val reader = stackReader
+        val ps = stackSurface
+        if (cam == null || s == null || reader == null || ps == null) return
+        try {
+            val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+            b.addTarget(reader.surface)
+            b.addTarget(ps)
+            applyControls(b, false)
+            s.capture(b.build(), null, handler)
+        } catch (e: Exception) {
+            log("Ошибка кадра: $e")
+            finishStack()
+        }
+    }
+
+    private fun onStackImage(r: ImageReader) {
+        val img = r.acquireNextImage() ?: return
+        try {
+            accumulate(img)
+        } catch (e: Exception) {
+            log("Ошибка обработки кадра: $e")
+        } finally {
+            img.close()
+        }
+        if (!stacking) return
+        stackCount++
+        val cnt = stackCount
+        val tgt = stackTarget
+        runOnUiThread { btnStack.text = "Стоп $cnt/$tgt" }
+        if (stackCancel || cnt >= tgt) finishStack() else captureStackFrame()
+    }
+
+    private fun accumulate(img: Image) {
+        val ya = yAcc ?: return
+        val ua = uAcc ?: return
+        val va = vAcc ?: return
+        val w = stackW
+        val h = stackH
+        if (img.width != w || img.height != h) return
+        val yp = img.planes[0]
+        val up = img.planes[1]
+        val vp = img.planes[2]
+        val yb = yp.buffer
+        val ub = up.buffer
+        val vb = vp.buffer
+        val row = ByteArray(w)
+        val sum = stackSum
+        for (y in 0 until h) {
+            yb.position(y * yp.rowStride)
+            yb.get(row, 0, w)
+            val o = y * w
+            if (sum) {
+                for (x in 0 until w) ya[o + x] += lin[row[x].toInt() and 0xFF]
+            } else {
+                for (x in 0 until w) ya[o + x] += row[x].toInt() and 0xFF
+            }
+        }
+        val cw = w / 2
+        val ch = h / 2
+        for (y in 0 until ch) {
+            for (x in 0 until cw) {
+                val ui = y * up.rowStride + x * up.pixelStride
+                val vi = y * vp.rowStride + x * vp.pixelStride
+                ua[y * cw + x] += ub.get(ui).toInt() and 0xFF
+                va[y * cw + x] += vb.get(vi).toInt() and 0xFF
+            }
+        }
+    }
+
+    private fun buildStackJpeg(n: Int): ByteArray? {
+        val ya = yAcc ?: return null
+        val ua = uAcc ?: return null
+        val va = vAcc ?: return null
+        val w = stackW
+        val h = stackH
+        val nv = ByteArray(w * h * 3 / 2)
+        val inv = invLut
+        val sum = stackSum
+        for (i in 0 until w * h) {
+            nv[i] = if (sum) inv[min(ya[i] shr 2, 16383)].toByte() else (ya[i] / n).toByte()
+        }
+        val cw = w / 2
+        val ch = h / 2
+        var p = w * h
+        for (y in 0 until ch) {
+            for (x in 0 until cw) {
+                val ci = y * cw + x
+                var u = ua[ci].toFloat() / n - 128f
+                var v = va[ci].toFloat() / n - 128f
+                if (sum) {
+                    val sl = ya[(2 * y) * w + 2 * x]
+                    val outY = inv[min(sl shr 2, 16383)]
+                    val avgY = inv[min((sl / n) shr 2, 16383)]
+                    val k = if (avgY > 0) min(outY.toFloat() / avgY, 8f) else 1f
+                    u *= k
+                    v *= k
+                }
+                nv[p++] = (v + 128f).coerceIn(0f, 255f).toInt().toByte()
+                nv[p++] = (u + 128f).coerceIn(0f, 255f).toInt().toByte()
+            }
+        }
+        val yuv = YuvImage(nv, ImageFormat.NV21, w, h, null)
+        val out = ByteArrayOutputStream()
+        yuv.compressToJpeg(Rect(0, 0, w, h), 95, out)
+        return out.toByteArray()
+    }
+
+    private fun finishStack() {
+        val n = stackCount
+        stacking = false
+        try {
+            if (n == 0) {
+                log("Кадров нет")
+            } else {
+                log("Обработка $n кадров...")
+                val jpeg = buildStackJpeg(n)
+                if (jpeg != null) savePhoto(jpeg, outputRotation()) else log("Нет данных")
+            }
+        } catch (e: Throwable) {
+            log("Ошибка обработки: $e")
+        }
+        cleanupStack()
+        startPreview()
     }
 
     // ---------- запись видео ----------
@@ -571,6 +875,7 @@ class MainActivity : Activity() {
     private fun startRecording() {
         val cam = device
         if (cam == null) { log("Сначала откройте камеру"); return }
+        if (stacking) { log("Идёт долгая выдержка"); return }
         try {
             val values = ContentValues().apply {
                 put(MediaStore.Video.Media.DISPLAY_NAME, "macro_" + System.currentTimeMillis() + ".mp4")
@@ -704,6 +1009,10 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         savePrefs()
+        if (stacking) {
+            stacking = false
+            cleanupStack()
+        }
         if (recording) stopRecording()
         closeAll()
         super.onPause()
