@@ -7,6 +7,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.SharedPreferences
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.graphics.Matrix
@@ -27,6 +28,10 @@ import android.util.Range
 import android.util.Size
 import android.view.Surface
 import android.view.TextureView
+import android.view.View
+import android.view.WindowInsets
+import android.view.WindowInsetsController
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
@@ -72,7 +77,10 @@ class MainActivity : Activity() {
     private var minFocus: Float = 0f
     private var maxZoom: Float = 1f
     private var streamMap: StreamConfigurationMap? = null
-    private var wide = false
+    private var aspectMode = 0
+    private var videoCandidates: List<Size> = emptyList()
+    private lateinit var panel: View
+    private lateinit var btnPanel: Button
     private var previewSize = Size(640, 480)
     private var videoSize = Size(1280, 720)
     private var photoSize = Size(1280, 960)
@@ -83,7 +91,15 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        if (Build.VERSION.SDK_INT >= 28) {
+            val lp = window.attributes
+            lp.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            window.attributes = lp
+        }
         setContentView(R.layout.activity_main)
+        hideSystemUi()
 
         prefs = getSharedPreferences("macro", MODE_PRIVATE)
         cm = getSystemService(CAMERA_SERVICE) as CameraManager
@@ -102,6 +118,8 @@ class MainActivity : Activity() {
         cbFlip = findViewById(R.id.cbFlip)
         btnRec = findViewById(R.id.btnRec)
         btnAspect = findViewById(R.id.btnAspect)
+        panel = findViewById(R.id.panel)
+        btnPanel = findViewById(R.id.btnPanel)
         sbZoom = findViewById(R.id.sbZoom)
         tvZoom = findViewById(R.id.tvZoom)
         thread = HandlerThread("cam").also { it.start() }
@@ -116,7 +134,7 @@ class MainActivity : Activity() {
         cbFocus.isChecked = prefs.getBoolean("manFocus", false)
         cbFlip.isChecked = prefs.getBoolean("flip", false)
         sbZoom.progress = prefs.getInt("zoom", 0)
-        wide = prefs.getBoolean("wide", false)
+        aspectMode = prefs.getInt("aspect", 0).coerceIn(0, 2)
         btnAspect.text = aspectLabel()
         texture.rotation = if (cbFlip.isChecked) 180f else 0f
         texture.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> updateTransform() }
@@ -147,6 +165,9 @@ class MainActivity : Activity() {
         sbFocus.setOnSeekBarChangeListener(seekListener)
         sbZoom.setOnSeekBarChangeListener(seekListener)
         btnAspect.setOnClickListener { toggleAspect() }
+        btnPanel.setOnClickListener {
+            panel.visibility = if (panel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        }
         cbExp.setOnCheckedChangeListener { _, _ -> savePrefs(); updateRepeating() }
         cbFocus.setOnCheckedChangeListener { _, _ -> savePrefs(); updateRepeating() }
         cbFlip.setOnCheckedChangeListener { _, checked ->
@@ -170,7 +191,7 @@ class MainActivity : Activity() {
             .putBoolean("manFocus", cbFocus.isChecked)
             .putBoolean("flip", cbFlip.isChecked)
             .putInt("zoom", sbZoom.progress)
-            .putBoolean("wide", wide)
+            .putInt("aspect", aspectMode)
             .apply()
     }
 
@@ -321,7 +342,7 @@ class MainActivity : Activity() {
     private fun currentZoom(): Float =
         maxZoom.toDouble().pow(sbZoom.progress / 1000.0).toFloat()
 
-    private fun aspectLabel(): String = "Формат: " + (if (wide) "9:16" else "3:4")
+    private fun aspectLabel(): String = "Формат: " + arrayOf("4:3", "16:9", "20:9")[aspectMode]
 
     private fun updateLabels() {
         tvIso.text = "ISO: " + currentIso()
@@ -426,21 +447,20 @@ class MainActivity : Activity() {
         runOnUiThread { updateLabels() }
     }
 
-    private fun pick(sizes: Array<Size>?, maxW: Int, maxH: Int, fallback: Size): Size {
-        if (sizes == null) return fallback
-        val target = if (wide) 16.0 / 9.0 else 4.0 / 3.0
-        val fit = sizes.filter { it.width <= maxW && it.height <= maxH }
-        val inRatio = fit.filter { Math.abs(it.width.toDouble() / it.height - target) < 0.03 }
-        val best = inRatio.maxByOrNull { it.width * it.height }
-            ?: fit.maxByOrNull { it.width * it.height }
-        return best ?: fallback
+    private fun sizesFor(sizes: Array<Size>?): List<Size> {
+        if (sizes == null) return emptyList()
+        val target = doubleArrayOf(4.0 / 3.0, 16.0 / 9.0, 20.0 / 9.0)[aspectMode]
+        return sizes
+            .filter { Math.abs(it.width.toDouble() / it.height - target) < 0.02 }
+            .sortedByDescending { it.width * it.height }
     }
 
     private fun computeSizes() {
         val map = streamMap ?: return
-        previewSize = pick(map.getOutputSizes(SurfaceTexture::class.java), 1280, 960, previewSize)
-        videoSize = pick(map.getOutputSizes(MediaRecorder::class.java), 1920, 1080, videoSize)
-        photoSize = pick(map.getOutputSizes(ImageFormat.JPEG), Int.MAX_VALUE, Int.MAX_VALUE, photoSize)
+        previewSize = sizesFor(map.getOutputSizes(SurfaceTexture::class.java)).firstOrNull() ?: previewSize
+        videoCandidates = sizesFor(map.getOutputSizes(MediaRecorder::class.java))
+        videoSize = videoCandidates.firstOrNull() ?: videoSize
+        photoSize = sizesFor(map.getOutputSizes(ImageFormat.JPEG)).firstOrNull() ?: photoSize
         log(aspectLabel() + ": превью $previewSize, видео $videoSize, фото $photoSize")
         updateTransform()
     }
@@ -481,7 +501,7 @@ class MainActivity : Activity() {
 
     private fun toggleAspect() {
         if (recording) { log("Сначала остановите запись"); return }
-        wide = !wide
+        aspectMode = (aspectMode + 1) % 3
         btnAspect.text = aspectLabel()
         savePrefs()
         if (device != null) {
@@ -638,22 +658,43 @@ class MainActivity : Activity() {
             if (fd == null) { log("Не удалось открыть файл видео"); return }
             pfd = fd
 
-            val r = MediaRecorder()
-            r.setVideoSource(MediaRecorder.VideoSource.SURFACE)
-            r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            r.setOutputFile(fd.fileDescriptor)
-            r.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-            r.setVideoEncodingBitRate(12_000_000)
-            r.setVideoFrameRate(30)
-            r.setVideoSize(videoSize.width, videoSize.height)
-            r.setOrientationHint(if (cbFlip.isChecked) 180 else 0)
-            r.prepare()
-            recorder = r
+            val cands = if (videoCandidates.isEmpty()) listOf(videoSize) else videoCandidates.take(4)
+            var made: MediaRecorder? = null
+            for (sz in cands) {
+                val t = MediaRecorder()
+                try {
+                    t.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+                    t.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                    t.setOutputFile(fd.fileDescriptor)
+                    t.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+                    val br = (sz.width.toLong() * sz.height * 30 * 0.15).toLong()
+                        .coerceIn(8_000_000L, 50_000_000L).toInt()
+                    t.setVideoEncodingBitRate(br)
+                    t.setVideoFrameRate(30)
+                    t.setVideoSize(sz.width, sz.height)
+                    t.setOrientationHint(if (cbFlip.isChecked) 180 else 0)
+                    t.prepare()
+                    made = t
+                    videoSize = sz
+                    log("Видео: " + sz.width + "x" + sz.height + ", " + (br / 1_000_000) + " Мбит/с")
+                    break
+                } catch (e: Exception) {
+                    log("Размер " + sz.width + "x" + sz.height + " не подошёл: " + e)
+                    try { t.reset() } catch (_: Exception) {}
+                    try { t.release() } catch (_: Exception) {}
+                }
+            }
+            val rec: MediaRecorder = made ?: run {
+                log("Не удалось подготовить запись")
+                cleanupRecorder()
+                return
+            }
+            recorder = rec
 
             val st = texture.surfaceTexture!!
             st.setDefaultBufferSize(previewSize.width, previewSize.height)
             val pSurface = Surface(st)
-            val rSurface = r.surface
+            val rSurface = rec.surface
             val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
             b.addTarget(pSurface)
             b.addTarget(rSurface)
@@ -667,7 +708,7 @@ class MainActivity : Activity() {
                     session = s
                     try {
                         s.setRepeatingRequest(b.build(), null, handler)
-                        r.start()
+                        rec.start()
                         recording = true
                         runOnUiThread { btnRec.text = "Стоп" }
                         log("ЗАПИСЬ ИДЁТ")
@@ -696,6 +737,28 @@ class MainActivity : Activity() {
         btnRec.text = "Запись"
         log("Видео сохранено: Movies/MacroCam")
         startPreview()
+    }
+
+    private fun hideSystemUi() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.setDecorFitsSystemWindows(false)
+            window.insetsController?.let {
+                it.hide(WindowInsets.Type.systemBars())
+                it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        } else {
+            window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_FULLSCREEN
+                    or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                    or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN)
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideSystemUi()
     }
 
     override fun onPause() {

@@ -1,162 +1,200 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:padding="8dp">
+    android:background="#000000">
 
-    <LinearLayout
+    <TextureView
+        android:id="@+id/texture"
         android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <!-- Левая колонка: всегда на экране -->
+    <LinearLayout
+        android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:orientation="horizontal">
-
-        <EditText
-            android:id="@+id/idInput"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:hint="Camera ID"
-            android:inputType="text"
-            android:text="3" />
+        android:layout_gravity="start|center_vertical"
+        android:layout_marginStart="8dp"
+        android:orientation="vertical">
 
         <Button
-            android:id="@+id/btnOpen"
+            android:id="@+id/btnPanel"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Открыть" />
+            android:text="Панель" />
 
         <Button
-            android:id="@+id/btnList"
+            android:id="@+id/btnPhoto"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Список" />
+            android:text="Фото" />
 
         <Button
-            android:id="@+id/btnData"
+            android:id="@+id/btnRec"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Данные" />
+            android:text="Запись" />
     </LinearLayout>
 
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:gravity="center_vertical"
-        android:orientation="horizontal">
+    <!-- Правая панель настроек (можно скрыть кнопкой «Панель») -->
+    <ScrollView
+        android:id="@+id/panel"
+        android:layout_width="320dp"
+        android:layout_height="match_parent"
+        android:layout_gravity="end"
+        android:background="#99000000"
+        android:padding="8dp">
 
-        <CheckBox
-            android:id="@+id/cbFlip"
-            android:layout_width="0dp"
+        <LinearLayout
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="Перевернуть 180°" />
+            android:orientation="vertical">
 
-        <Button
-            android:id="@+id/btnAspect"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="Формат: 3:4" />
-    </LinearLayout>
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
 
+                <EditText
+                    android:id="@+id/idInput"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:hint="Camera ID"
+                    android:inputType="text"
+                    android:text="3"
+                    android:textColor="#FFFFFF"
+                    android:textColorHint="#AAAAAA" />
+
+                <Button
+                    android:id="@+id/btnOpen"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Открыть" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/btnList"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Список" />
+
+                <Button
+                    android:id="@+id/btnData"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Данные" />
+            </LinearLayout>
+
+            <Button
+                android:id="@+id/btnAspect"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Формат: 4:3" />
+
+            <CheckBox
+                android:id="@+id/cbFlip"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:buttonTint="#FFFFFF"
+                android:text="Перевернуть 180°"
+                android:textColor="#FFFFFF" />
+
+            <TextView
+                android:id="@+id/tvZoom"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Зум"
+                android:textColor="#FFFFFF" />
+
+            <SeekBar
+                android:id="@+id/sbZoom"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="1000"
+                android:progress="0" />
+
+            <CheckBox
+                android:id="@+id/cbExp"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:buttonTint="#FFFFFF"
+                android:text="Ручные ISO и выдержка"
+                android:textColor="#FFFFFF" />
+
+            <TextView
+                android:id="@+id/tvIso"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="ISO"
+                android:textColor="#FFFFFF" />
+
+            <SeekBar
+                android:id="@+id/sbIso"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="1000"
+                android:progress="200" />
+
+            <TextView
+                android:id="@+id/tvExp"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Выдержка"
+                android:textColor="#FFFFFF" />
+
+            <SeekBar
+                android:id="@+id/sbExp"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="1000"
+                android:progress="500" />
+
+            <CheckBox
+                android:id="@+id/cbFocus"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:buttonTint="#FFFFFF"
+                android:text="Ручной фокус"
+                android:textColor="#FFFFFF" />
+
+            <TextView
+                android:id="@+id/tvFocus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Фокус"
+                android:textColor="#FFFFFF" />
+
+            <SeekBar
+                android:id="@+id/sbFocus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="1000"
+                android:progress="800" />
+        </LinearLayout>
+    </ScrollView>
+
+    <!-- Лог внизу слева -->
     <ScrollView
         android:id="@+id/logScroll"
-        android:layout_width="match_parent"
-        android:layout_height="50dp">
+        android:layout_width="380dp"
+        android:layout_height="64dp"
+        android:layout_gravity="bottom|start"
+        android:layout_marginStart="96dp"
+        android:background="#66000000">
 
         <TextView
             android:id="@+id/log"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:textColor="#FFFFFF"
             android:textSize="11sp" />
     </ScrollView>
-
-    <TextureView
-        android:id="@+id/texture"
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1" />
-
-    <TextView
-        android:id="@+id/tvZoom"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Зум" />
-
-    <SeekBar
-        android:id="@+id/sbZoom"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:max="1000"
-        android:progress="0" />
-
-    <CheckBox
-        android:id="@+id/cbExp"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="Ручные ISO и выдержка" />
-
-    <TextView
-        android:id="@+id/tvIso"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="ISO" />
-
-    <SeekBar
-        android:id="@+id/sbIso"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:max="1000"
-        android:progress="200" />
-
-    <TextView
-        android:id="@+id/tvExp"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Выдержка" />
-
-    <SeekBar
-        android:id="@+id/sbExp"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:max="1000"
-        android:progress="500" />
-
-    <CheckBox
-        android:id="@+id/cbFocus"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="Ручной фокус" />
-
-    <TextView
-        android:id="@+id/tvFocus"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Фокус" />
-
-    <SeekBar
-        android:id="@+id/sbFocus"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:max="1000"
-        android:progress="800" />
-
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal">
-
-        <Button
-            android:id="@+id/btnPhoto"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="Фото" />
-
-        <Button
-            android:id="@+id/btnRec"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="Запись" />
-    </LinearLayout>
-</LinearLayout>
+</FrameLayout>
