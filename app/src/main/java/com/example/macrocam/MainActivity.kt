@@ -87,7 +87,10 @@ class MainActivity : Activity() {
     private var boostRange: Range<Int>? = null
     private var maxFrameDuration: Long = Long.MAX_VALUE
     private lateinit var btnStack: Button
-    private lateinit var cbNoNr: CheckBox
+    private lateinit var btnNr: Button
+    private lateinit var btnEdge: Button
+    private var nrMode = -1
+    private var edgeMode = -1
     private lateinit var cbNoProc: CheckBox
     private lateinit var btnBitrate: Button
     private val bitrates = intArrayOf(0, 20, 40, 80)
@@ -158,7 +161,8 @@ class MainActivity : Activity() {
         btnPanel = findViewById(R.id.btnPanel)
         sbZoom = findViewById(R.id.sbZoom)
         btnStack = findViewById(R.id.btnStack)
-        cbNoNr = findViewById(R.id.cbNoNr)
+        btnNr = findViewById(R.id.btnNr)
+        btnEdge = findViewById(R.id.btnEdge)
         cbNoProc = findViewById(R.id.cbNoProc)
         btnBitrate = findViewById(R.id.btnBitrate)
         sbStack = findViewById(R.id.sbStack)
@@ -177,7 +181,9 @@ class MainActivity : Activity() {
         sbStack.progress = prefs.getInt("stack", 28)
         cbStackSum.isChecked = prefs.getBoolean("stackSum", true)
         sbBoost.progress = prefs.getInt("boost", 0)
-        cbNoNr.isChecked = prefs.getBoolean("noNr", false)
+        nrMode = prefs.getInt("nrMode", -1)
+        edgeMode = prefs.getInt("edgeMode", -1)
+        updateModeButtons()
         cbNoProc.isChecked = prefs.getBoolean("noProc", false)
         bitrateIdx = prefs.getInt("bitrate", 0).coerceIn(0, bitrates.size - 1)
         btnBitrate.text = bitrateLabel()
@@ -224,7 +230,26 @@ class MainActivity : Activity() {
         sbStack.setOnSeekBarChangeListener(seekListener)
         sbBoost.setOnSeekBarChangeListener(seekListener)
         btnStack.setOnClickListener { startStack() }
-        cbNoNr.setOnCheckedChangeListener { _, _ -> savePrefs(); updateRepeating() }
+        btnNr.setOnClickListener {
+            nrMode = nextMode(
+                nrMode,
+                chars?.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES),
+                intArrayOf(0, 1, 2, 3, 4)
+            )
+            updateModeButtons()
+            savePrefs()
+            updateRepeating()
+        }
+        btnEdge.setOnClickListener {
+            edgeMode = nextMode(
+                edgeMode,
+                chars?.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES),
+                intArrayOf(0, 1, 2, 3)
+            )
+            updateModeButtons()
+            savePrefs()
+            updateRepeating()
+        }
         cbNoProc.setOnCheckedChangeListener { _, _ -> savePrefs(); updateRepeating() }
         btnBitrate.setOnClickListener {
             if (recording) {
@@ -265,7 +290,8 @@ class MainActivity : Activity() {
             .putInt("stack", sbStack.progress)
             .putBoolean("stackSum", cbStackSum.isChecked)
             .putInt("boost", sbBoost.progress)
-            .putBoolean("noNr", cbNoNr.isChecked)
+            .putInt("nrMode", nrMode)
+            .putInt("edgeMode", edgeMode)
             .putBoolean("noProc", cbNoProc.isChecked)
             .putInt("bitrate", bitrateIdx)
             .putInt("aspect", aspectMode)
@@ -346,19 +372,51 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun nrName(m: Int): String = when (m) {
+        -1 -> "авто"
+        0 -> "выкл"
+        1 -> "быстрое"
+        2 -> "высокое"
+        3 -> "минимальное"
+        4 -> "ZSL"
+        else -> m.toString()
+    }
+
+    private fun edgeName(m: Int): String = when (m) {
+        -1 -> "авто"
+        0 -> "выкл"
+        1 -> "быстрый"
+        2 -> "высокий"
+        3 -> "ZSL"
+        else -> m.toString()
+    }
+
+    private fun nextMode(current: Int, supported: IntArray?, fallback: IntArray): Int {
+        val list = listOf(-1) + (supported ?: fallback).sorted()
+        val i = list.indexOf(current)
+        return list[(i + 1) % list.size]
+    }
+
+    private fun updateModeButtons() {
+        btnNr.text = "Шумоподавление: " + nrName(nrMode)
+        btnEdge.text = "Контуры: " + edgeName(edgeMode)
+    }
+
     private fun applyProcessing(b: CaptureRequest.Builder) {
         val c = chars ?: return
-        if (cbNoNr.isChecked) {
+        if (nrMode >= 0) {
             val m = c.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)
-            if (m != null && m.contains(CameraMetadata.NOISE_REDUCTION_MODE_OFF)) {
-                b.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_OFF)
+            if (m != null && m.contains(nrMode)) {
+                b.set(CaptureRequest.NOISE_REDUCTION_MODE, nrMode)
+            }
+        }
+        if (edgeMode >= 0) {
+            val e = c.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES)
+            if (e != null && e.contains(edgeMode)) {
+                b.set(CaptureRequest.EDGE_MODE, edgeMode)
             }
         }
         if (cbNoProc.isChecked) {
-            val e = c.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES)
-            if (e != null && e.contains(CameraMetadata.EDGE_MODE_OFF)) {
-                b.set(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_OFF)
-            }
             val v = c.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
             if (v != null && v.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)) {
                 b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,

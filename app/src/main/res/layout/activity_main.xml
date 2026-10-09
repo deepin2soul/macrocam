@@ -181,20 +181,24 @@
                 android:text="Суммировать (ярче); выкл. = среднее"
                 android:textColor="#FFFFFF" />
 
-            <CheckBox
-                android:id="@+id/cbNoNr"
-                android:layout_width="wrap_content"
+            <Button
+                android:id="@+id/btnNr"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:buttonTint="#FFFFFF"
-                android:text="Шумоподавление: выкл"
-                android:textColor="#FFFFFF" />
+                android:text="Шумоподавление: авто" />
+
+            <Button
+                android:id="@+id/btnEdge"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Контуры: авто" />
 
             <CheckBox
                 android:id="@+id/cbNoProc"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:buttonTint="#FFFFFF"
-                android:text="Без контуров и стабилизации"
+                android:text="Стабилизация: выкл"
                 android:textColor="#FFFFFF" />
 
             <Button
