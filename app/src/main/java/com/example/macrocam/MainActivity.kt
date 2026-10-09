@@ -87,6 +87,11 @@ class MainActivity : Activity() {
     private var boostRange: Range<Int>? = null
     private var maxFrameDuration: Long = Long.MAX_VALUE
     private lateinit var btnStack: Button
+    private lateinit var cbNoNr: CheckBox
+    private lateinit var cbNoProc: CheckBox
+    private lateinit var btnBitrate: Button
+    private val bitrates = intArrayOf(0, 20, 40, 80)
+    private var bitrateIdx = 0
     private lateinit var sbStack: SeekBar
     private lateinit var tvStack: TextView
     private lateinit var cbStackSum: CheckBox
@@ -153,6 +158,9 @@ class MainActivity : Activity() {
         btnPanel = findViewById(R.id.btnPanel)
         sbZoom = findViewById(R.id.sbZoom)
         btnStack = findViewById(R.id.btnStack)
+        cbNoNr = findViewById(R.id.cbNoNr)
+        cbNoProc = findViewById(R.id.cbNoProc)
+        btnBitrate = findViewById(R.id.btnBitrate)
         sbStack = findViewById(R.id.sbStack)
         tvStack = findViewById(R.id.tvStack)
         cbStackSum = findViewById(R.id.cbStackSum)
@@ -169,6 +177,10 @@ class MainActivity : Activity() {
         sbStack.progress = prefs.getInt("stack", 28)
         cbStackSum.isChecked = prefs.getBoolean("stackSum", true)
         sbBoost.progress = prefs.getInt("boost", 0)
+        cbNoNr.isChecked = prefs.getBoolean("noNr", false)
+        cbNoProc.isChecked = prefs.getBoolean("noProc", false)
+        bitrateIdx = prefs.getInt("bitrate", 0).coerceIn(0, bitrates.size - 1)
+        btnBitrate.text = bitrateLabel()
         cbExp.isChecked = prefs.getBoolean("manExp", false)
         cbFocus.isChecked = prefs.getBoolean("manFocus", false)
         cbFlip.isChecked = prefs.getBoolean("flip", false)
@@ -212,6 +224,17 @@ class MainActivity : Activity() {
         sbStack.setOnSeekBarChangeListener(seekListener)
         sbBoost.setOnSeekBarChangeListener(seekListener)
         btnStack.setOnClickListener { startStack() }
+        cbNoNr.setOnCheckedChangeListener { _, _ -> savePrefs(); updateRepeating() }
+        cbNoProc.setOnCheckedChangeListener { _, _ -> savePrefs(); updateRepeating() }
+        btnBitrate.setOnClickListener {
+            if (recording) {
+                log("Битрейт нельзя менять во время записи")
+            } else {
+                bitrateIdx = (bitrateIdx + 1) % bitrates.size
+                btnBitrate.text = bitrateLabel()
+                savePrefs()
+            }
+        }
         cbStackSum.setOnCheckedChangeListener { _, _ -> savePrefs() }
         btnAspect.setOnClickListener { toggleAspect() }
         btnPanel.setOnClickListener {
@@ -242,6 +265,9 @@ class MainActivity : Activity() {
             .putInt("stack", sbStack.progress)
             .putBoolean("stackSum", cbStackSum.isChecked)
             .putInt("boost", sbBoost.progress)
+            .putBoolean("noNr", cbNoNr.isChecked)
+            .putBoolean("noProc", cbNoProc.isChecked)
+            .putInt("bitrate", bitrateIdx)
             .putInt("aspect", aspectMode)
             .apply()
     }
@@ -276,6 +302,11 @@ class MainActivity : Activity() {
 
     private fun currentZoom(): Float =
         maxZoom.toDouble().pow(sbZoom.progress / 1000.0).toFloat()
+
+    private fun bitrateLabel(): String {
+        val v = bitrates[bitrateIdx]
+        return "Битрейт: " + (if (v == 0) "авто" else "$v Мбит/с")
+    }
 
     private fun aspectLabel(): String = "Формат: " + arrayOf("4:3", "16:9", "20:9")[aspectMode]
 
@@ -315,8 +346,35 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun applyProcessing(b: CaptureRequest.Builder) {
+        val c = chars ?: return
+        if (cbNoNr.isChecked) {
+            val m = c.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)
+            if (m != null && m.contains(CameraMetadata.NOISE_REDUCTION_MODE_OFF)) {
+                b.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_OFF)
+            }
+        }
+        if (cbNoProc.isChecked) {
+            val e = c.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES)
+            if (e != null && e.contains(CameraMetadata.EDGE_MODE_OFF)) {
+                b.set(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_OFF)
+            }
+            val v = c.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
+            if (v != null && v.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)) {
+                b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                    CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+            }
+            val o = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+            if (o != null && o.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF)) {
+                b.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                    CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF)
+            }
+        }
+    }
+
     private fun applyControls(b: CaptureRequest.Builder, record: Boolean) {
         applyZoom(b)
+        applyProcessing(b)
         if (cbExp.isChecked && isoRange != null && expRange != null) {
             val exp = currentExp()
             b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
@@ -385,6 +443,10 @@ class MainActivity : Activity() {
             maxFrameDuration = c.get(CameraCharacteristics.SENSOR_INFO_MAX_FRAME_DURATION) ?: Long.MAX_VALUE
             boostRange = c.get(CameraCharacteristics.CONTROL_POST_RAW_SENSITIVITY_BOOST_RANGE)
             log("Цифровое усиление (post-RAW boost): $boostRange; макс. длительность кадра $maxFrameDuration нс")
+            log("Шумоподавление: " + c.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)?.joinToString() +
+                "; контуры: " + c.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES)?.joinToString() +
+                "; стабилизация видео: " + c.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)?.joinToString() +
+                "; OIS: " + c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)?.joinToString())
 
             val rr = if (Build.VERSION.SDK_INT >= 30)
                 c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) else null
@@ -897,7 +959,9 @@ class MainActivity : Activity() {
                     t.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
                     t.setOutputFile(fd.fileDescriptor)
                     t.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-                    val br = (sz.width.toLong() * sz.height * 30 * 0.15).toLong()
+                    val fixed = bitrates[bitrateIdx]
+                    val br = if (fixed > 0) fixed * 1_000_000
+                    else (sz.width.toLong() * sz.height * 30 * 0.15).toLong()
                         .coerceIn(8_000_000L, 50_000_000L).toInt()
                     t.setVideoEncodingBitRate(br)
                     t.setVideoFrameRate(30)
