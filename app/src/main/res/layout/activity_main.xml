@@ -50,49 +50,6 @@
             android:layout_height="wrap_content"
             android:orientation="vertical">
 
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal">
-
-                <EditText
-                    android:id="@+id/idInput"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:hint="Camera ID"
-                    android:inputType="text"
-                    android:text="3"
-                    android:textColor="#FFFFFF"
-                    android:textColorHint="#AAAAAA" />
-
-                <Button
-                    android:id="@+id/btnOpen"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Открыть" />
-            </LinearLayout>
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal">
-
-                <Button
-                    android:id="@+id/btnList"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="Список" />
-
-                <Button
-                    android:id="@+id/btnData"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="Данные" />
-            </LinearLayout>
-
             <Button
                 android:id="@+id/btnAspect"
                 android:layout_width="match_parent"
