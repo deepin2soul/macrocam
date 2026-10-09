@@ -2,6 +2,9 @@ package com.example.macrocam
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
@@ -11,6 +14,7 @@ import android.graphics.Rect
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
 import android.hardware.camera2.params.StreamConfigurationMap
+import android.media.CamcorderProfile
 import android.media.ImageReader
 import android.media.MediaRecorder
 import android.os.Build
@@ -118,6 +122,7 @@ class MainActivity : Activity() {
         texture.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> updateTransform() }
 
         findViewById<Button>(R.id.btnList).setOnClickListener { showList() }
+        findViewById<Button>(R.id.btnData).setOnClickListener { showData(idInput.text.toString().trim()) }
         findViewById<Button>(R.id.btnOpen).setOnClickListener {
             openById(idInput.text.toString().trim())
         }
@@ -182,6 +187,119 @@ class MainActivity : Activity() {
         } catch (e: Exception) {
             log("Ошибка списка: $e")
         }
+    }
+
+    // ---------- отчёт о камере ----------
+
+    private fun ratioLabel(s: Size): String {
+        val r = s.width.toDouble() / s.height
+        return when {
+            Math.abs(r - 4.0 / 3.0) < 0.01 -> "4:3"
+            Math.abs(r - 16.0 / 9.0) < 0.01 -> "16:9"
+            Math.abs(r - 3.0 / 2.0) < 0.01 -> "3:2"
+            Math.abs(r - 1.0) < 0.01 -> "1:1"
+            Math.abs(r - 2.0) < 0.01 -> "2:1"
+            Math.abs(r - 20.0 / 9.0) < 0.01 -> "20:9"
+            else -> String.format("%.3f", r)
+        }
+    }
+
+    private fun fmtSizes(sizes: Array<Size>?): String {
+        if (sizes == null || sizes.isEmpty()) return "  нет"
+        return sizes.sortedByDescending { it.width * it.height }
+            .joinToString("\n") { "  " + it.width + "x" + it.height + " (" + ratioLabel(it) + ")" }
+    }
+
+    private fun buildReport(id: String): String {
+        val sb = StringBuilder()
+        sb.append("Camera ID: ").append(id).append("\n")
+        sb.append("Android API: ").append(Build.VERSION.SDK_INT).append(", ")
+            .append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\n")
+        try {
+            val c = cm.getCameraCharacteristics(id)
+            fun line(name: String, v: Any?) {
+                sb.append(name).append(": ").append(v).append("\n")
+            }
+            line("HARDWARE_LEVEL", c.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL))
+            line("SENSOR_ORIENTATION", c.get(CameraCharacteristics.SENSOR_ORIENTATION))
+            line("LENS_FACING", c.get(CameraCharacteristics.LENS_FACING))
+            line("ACTIVE_ARRAY_SIZE", c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE))
+            line("PIXEL_ARRAY_SIZE", c.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE))
+            line("PHYSICAL_SIZE (мм)", c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE))
+            line("FOCAL_LENGTHS", c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.joinToString())
+            line("APERTURES", c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES)?.joinToString())
+            line("MIN_FOCUS_DISTANCE (дптр)", c.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE))
+            line("AF режимы", c.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)?.joinToString())
+            line("FPS диапазоны", c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.joinToString())
+            line("Макс. цифровой зум", c.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM))
+            if (Build.VERSION.SDK_INT >= 30) {
+                line("ZOOM_RATIO_RANGE", c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE))
+            }
+            line("CROPPING_TYPE", c.get(CameraCharacteristics.SCALER_CROPPING_TYPE))
+            line("Возможности", c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.joinToString())
+            line("ISO", c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE))
+            line("Выдержка (нс)", c.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE))
+
+            val map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            if (map != null) {
+                sb.append("\nФорматы вывода: ").append(map.outputFormats.joinToString()).append("\n")
+                sb.append("\nПревью (SurfaceTexture):\n").append(fmtSizes(map.getOutputSizes(SurfaceTexture::class.java)))
+                sb.append("\n\nВидео (MediaRecorder):\n").append(fmtSizes(map.getOutputSizes(MediaRecorder::class.java)))
+                sb.append("\n\nФото (JPEG):\n").append(fmtSizes(map.getOutputSizes(ImageFormat.JPEG)))
+                sb.append("\n\nYUV_420_888:\n").append(fmtSizes(map.getOutputSizes(ImageFormat.YUV_420_888)))
+                sb.append("\n")
+            }
+        } catch (e: Exception) {
+            sb.append("Характеристики недоступны: ").append(e).append("\n")
+        }
+        try {
+            val n = id.toInt()
+            sb.append("\nCamcorderProfile (старый API):\n")
+            val q = listOf(
+                "HIGH" to CamcorderProfile.QUALITY_HIGH,
+                "2160P" to CamcorderProfile.QUALITY_2160P,
+                "1080P" to CamcorderProfile.QUALITY_1080P,
+                "720P" to CamcorderProfile.QUALITY_720P
+            )
+            for ((name, quality) in q) {
+                if (CamcorderProfile.hasProfile(n, quality)) {
+                    val p = CamcorderProfile.get(n, quality)
+                    if (p != null) {
+                        sb.append("  ").append(name).append(": ")
+                            .append(p.videoFrameWidth).append("x").append(p.videoFrameHeight)
+                            .append(", ").append(p.videoFrameRate).append(" fps, ")
+                            .append(p.videoBitRate).append(" bps\n")
+                    }
+                } else {
+                    sb.append("  ").append(name).append(": нет\n")
+                }
+            }
+        } catch (e: Exception) {
+            sb.append("CamcorderProfile недоступен: ").append(e).append("\n")
+        }
+        return sb.toString()
+    }
+
+    private fun showData(id: String) {
+        if (id.isEmpty()) { log("Введите ID"); return }
+        val report = buildReport(id)
+        val tv = TextView(this)
+        tv.text = report
+        tv.textSize = 12f
+        tv.setTextIsSelectable(true)
+        tv.setPadding(24, 24, 24, 24)
+        val sv = ScrollView(this)
+        sv.addView(tv)
+        AlertDialog.Builder(this)
+            .setTitle("Данные камеры $id")
+            .setView(sv)
+            .setPositiveButton("Копировать") { _, _ ->
+                val cmgr = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                cmgr.setPrimaryClip(ClipData.newPlainText("camera", report))
+                log("Скопировано в буфер обмена")
+            }
+            .setNegativeButton("Закрыть", null)
+            .show()
     }
 
     // ---------- значения ползунков ----------
