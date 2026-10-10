@@ -19,6 +19,7 @@ import android.hardware.camera2.*
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.CamcorderProfile
 import android.media.ExifInterface
+import android.media.MediaCodec
 import android.media.Image
 import android.media.ImageReader
 import android.media.MediaRecorder
@@ -43,6 +44,7 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import java.io.ByteArrayOutputStream
+import java.io.File
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
@@ -84,6 +86,17 @@ class MainActivity : Activity() {
     private var maxZoom: Float = 1f
     private var streamMap: StreamConfigurationMap? = null
     private var aspectMode = 0
+    private var mode = 0 // 0 = фото, 1 = видео
+    private lateinit var btnMode: Button
+    private var persistentSurface: Surface? = null
+    private var previewSurface: Surface? = null
+    private var previewBuilder: CaptureRequest.Builder? = null
+    private var usePersistent = true
+    @Volatile private var sessionHasRecorder = false
+    private var recordingPersistent = false
+    @Volatile private var focusOverride: Float? = null
+    @Volatile private var rampActive = false
+    @Volatile private var rampToken = 0
     private var boostRange: Range<Int>? = null
     private var maxFrameDuration: Long = Long.MAX_VALUE
     private lateinit var btnStack: Button
@@ -161,6 +174,7 @@ class MainActivity : Activity() {
         btnPanel = findViewById(R.id.btnPanel)
         sbZoom = findViewById(R.id.sbZoom)
         btnStack = findViewById(R.id.btnStack)
+        btnMode = findViewById(R.id.btnMode)
         btnNr = findViewById(R.id.btnNr)
         btnEdge = findViewById(R.id.btnEdge)
         cbNoProc = findViewById(R.id.cbNoProc)
@@ -181,6 +195,8 @@ class MainActivity : Activity() {
         sbStack.progress = prefs.getInt("stack", 28)
         cbStackSum.isChecked = prefs.getBoolean("stackSum", true)
         sbBoost.progress = prefs.getInt("boost", 0)
+        mode = prefs.getInt("mode", 0).coerceIn(0, 1)
+        updateModeUi()
         nrMode = prefs.getInt("nrMode", -1)
         edgeMode = prefs.getInt("edgeMode", -1)
         updateModeButtons()
@@ -230,6 +246,7 @@ class MainActivity : Activity() {
         sbStack.setOnSeekBarChangeListener(seekListener)
         sbBoost.setOnSeekBarChangeListener(seekListener)
         btnStack.setOnClickListener { startStack() }
+        btnMode.setOnClickListener { toggleMode() }
         btnNr.setOnClickListener {
             nrMode = nextMode(
                 nrMode,
@@ -291,6 +308,7 @@ class MainActivity : Activity() {
             .putBoolean("stackSum", cbStackSum.isChecked)
             .putInt("boost", sbBoost.progress)
             .putInt("nrMode", nrMode)
+            .putInt("mode", mode)
             .putInt("edgeMode", edgeMode)
             .putBoolean("noProc", cbNoProc.isChecked)
             .putInt("bitrate", bitrateIdx)
@@ -448,7 +466,7 @@ class MainActivity : Activity() {
         }
         if (cbFocus.isChecked) {
             b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
-            b.set(CaptureRequest.LENS_FOCUS_DISTANCE, currentFocus())
+            b.set(CaptureRequest.LENS_FOCUS_DISTANCE, focusOverride ?: currentFocus())
         } else {
             val want = if (record) CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO
             else CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE
@@ -476,6 +494,12 @@ class MainActivity : Activity() {
         try { session?.close() } catch (_: Exception) {}
         try { device?.close() } catch (_: Exception) {}
         try { imageReader?.close() } catch (_: Exception) {}
+        try { persistentSurface?.release() } catch (_: Exception) {}
+        persistentSurface = null
+        sessionHasRecorder = false
+        rampToken++
+        rampActive = false
+        focusOverride = null
         session = null
         device = null
         builder = null
@@ -611,6 +635,7 @@ class MainActivity : Activity() {
     private fun toggleAspect() {
         if (recording || stacking) { log("Сначала остановите запись или долгую выдержку"); return }
         aspectMode = (aspectMode + 1) % 3
+        usePersistent = true
         btnAspect.text = aspectLabel()
         savePrefs()
         if (device != null) {
@@ -668,33 +693,143 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun updateModeUi() {
+        btnMode.text = if (mode == 0) "Режим: Фото" else "Режим: Видео"
+        val photo = mode == 0
+        findViewById<View>(R.id.btnPhoto).visibility = if (photo) View.VISIBLE else View.GONE
+        btnStack.visibility = if (photo) View.VISIBLE else View.GONE
+        btnRec.visibility = if (photo) View.GONE else View.VISIBLE
+    }
+
+    private fun toggleMode() {
+        if (recording || stacking) { log("Сначала остановите запись или долгую выдержку"); return }
+        if (rampActive) { log("Подождите, линза встаёт на место"); return }
+        mode = 1 - mode
+        savePrefs()
+        updateModeUi()
+        if (device != null) startPreview()
+    }
+
+    // Плавный возврат линзы: после пересоздания сессии камера уезжает на бесконечность,
+    // поэтому ручной фокус возвращаем плавно (около 1,2 с), затем ждём, пока линза успокоится
+    private fun startFocusRamp(onDone: () -> Unit) {
+        rampToken++
+        val tok = rampToken
+        if (!cbFocus.isChecked || minFocus <= 0f) {
+            focusOverride = null
+            rampActive = false
+            onDone()
+            return
+        }
+        rampActive = true
+        val t0 = System.currentTimeMillis()
+        val dur = 1200L
+        val step = object : Runnable {
+            override fun run() {
+                if (tok != rampToken) return
+                val t = ((System.currentTimeMillis() - t0).toFloat() / dur).coerceIn(0f, 1f)
+                val e = t * t * (3f - 2f * t)
+                focusOverride = currentFocus() * e
+                updateRepeating()
+                if (t < 1f) {
+                    handler.postDelayed(this, 40)
+                } else {
+                    focusOverride = null
+                    updateRepeating()
+                    handler.postDelayed({
+                        if (tok == rampToken) {
+                            rampActive = false
+                            onDone()
+                        }
+                    }, 600)
+                }
+            }
+        }
+        handler.post(step)
+    }
+
+    private fun createPersistentSurface(): Surface? {
+        try { persistentSurface?.release() } catch (_: Exception) {}
+        persistentSurface = null
+        val cands = if (videoCandidates.isEmpty()) listOf(videoSize) else videoCandidates.take(4)
+        for (sz in cands) {
+            val tmp = File(cacheDir, "tmp_rec.mp4")
+            var surf: Surface? = null
+            val t = MediaRecorder()
+            try {
+                surf = MediaCodec.createPersistentInputSurface()
+                t.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+                t.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                t.setOutputFile(tmp.absolutePath)
+                t.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+                t.setVideoEncodingBitRate(10_000_000)
+                t.setVideoFrameRate(30)
+                t.setVideoSize(sz.width, sz.height)
+                t.setInputSurface(surf)
+                t.prepare()
+                t.release()
+                tmp.delete()
+                videoSize = sz
+                persistentSurface = surf
+                return surf
+            } catch (e: Exception) {
+                log("Видео " + sz.width + "x" + sz.height + " не подошло: " + e)
+                try { t.reset() } catch (_: Exception) {}
+                try { t.release() } catch (_: Exception) {}
+                try { surf?.release() } catch (_: Exception) {}
+            }
+        }
+        return null
+    }
+
     private fun startPreview() {
         val cam = device ?: return
         try {
             try { session?.close() } catch (_: Exception) {}
             session = null
+            sessionHasRecorder = false
             val st = texture.surfaceTexture!!
             st.setDefaultBufferSize(previewSize.width, previewSize.height)
             val surface = Surface(st)
+            previewSurface = surface
+            focusOverride = if (cbFocus.isChecked && minFocus > 0f) 0f else null
             val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             b.addTarget(surface)
             applyControls(b, false)
             builder = b
+            previewBuilder = b
             val targets = ArrayList<Surface>()
             targets.add(surface)
-            imageReader?.let { targets.add(it.surface) }
+            var ps: Surface? = null
+            if (mode == 1) {
+                if (usePersistent) ps = createPersistentSurface()
+                if (ps != null) targets.add(ps)
+            } else {
+                imageReader?.let { targets.add(it.surface) }
+            }
+            val hasRec = ps != null
             cam.createCaptureSession(targets, object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     session = s
+                    sessionHasRecorder = hasRec
                     try {
                         s.setRepeatingRequest(b.build(), null, handler)
-                        log("ПРЕВЬЮ ЗАПУЩЕНО")
+                        log("Режим " + (if (mode == 0) "«Фото»" else "«Видео»") + ": превью запущено")
                     } catch (e: Exception) {
                         log("Ошибка запроса: $e")
                     }
+                    startFocusRamp { log("Линза на месте, можно снимать") }
                 }
                 override fun onConfigureFailed(s: CameraCaptureSession) {
-                    log("Сессия не настроилась")
+                    if (hasRec) {
+                        log("Сессия с видео не настроилась, запись будет с перенастройкой камеры")
+                        usePersistent = false
+                        try { persistentSurface?.release() } catch (_: Exception) {}
+                        persistentSurface = null
+                        startPreview()
+                    } else {
+                        log("Сессия не настроилась")
+                    }
                 }
             }, handler)
         } catch (e: Exception) {
@@ -711,6 +846,8 @@ class MainActivity : Activity() {
         if (cam == null || s == null || reader == null) { log("Сначала откройте камеру"); return }
         if (recording) { log("Во время записи фото недоступно"); return }
         if (stacking) { log("Идёт долгая выдержка"); return }
+        if (mode != 0) { log("Переключите режим на «Фото»"); return }
+        if (rampActive) { log("Подождите, линза встаёт на место"); return }
         try {
             val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             b.addTarget(reader.surface)
@@ -777,6 +914,7 @@ class MainActivity : Activity() {
         try { stackReader?.close() } catch (_: Exception) {}
         stackReader = null
         stackSurface = null
+        sessionHasRecorder = false
         yAcc = null
         uAcc = null
         vAcc = null
@@ -792,6 +930,8 @@ class MainActivity : Activity() {
         val cam = device
         if (cam == null) { log("Сначала откройте камеру"); return }
         if (recording) { log("Остановите запись"); return }
+        if (mode != 0) { log("Переключите режим на «Фото»"); return }
+        if (rampActive) { log("Подождите, линза встаёт на место"); return }
         if (!cbExp.isChecked || isoRange == null || expRange == null) {
             log("Включите «Ручные ISO и выдержка» и задайте выдержку одного кадра")
             return
@@ -829,6 +969,8 @@ class MainActivity : Activity() {
             st.setDefaultBufferSize(previewSize.width, previewSize.height)
             val pSurface = Surface(st)
             stackSurface = pSurface
+            sessionHasRecorder = false
+            focusOverride = if (cbFocus.isChecked && minFocus > 0f) 0f else null
             val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             b.addTarget(pSurface)
             applyControls(b, false)
@@ -837,7 +979,7 @@ class MainActivity : Activity() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     session = s
                     log("Долгая выдержка: $n кадров, режим " + (if (stackSum) "сумма" else "среднее"))
-                    captureStackFrame()
+                    startFocusRamp { captureStackFrame() }
                 }
                 override fun onConfigureFailed(s: CameraCaptureSession) {
                     log("Сессия не настроилась")
@@ -993,6 +1135,93 @@ class MainActivity : Activity() {
     }
 
     private fun startRecording() {
+        if (stacking) { log("Идёт долгая выдержка"); return }
+        if (device == null) { log("Камера ещё не открыта"); return }
+        if (mode != 1) { log("Переключите режим на «Видео»"); return }
+        if (rampActive) { log("Подождите, линза встаёт на место"); return }
+        if (sessionHasRecorder && persistentSurface != null) startRecordingPersistent()
+        else startRecordingLegacy()
+    }
+
+    private fun restorePreview() {
+        val sess = session ?: return
+        val pb = previewBuilder ?: return
+        builder = pb
+        try {
+            applyControls(pb, false)
+            sess.setRepeatingRequest(pb.build(), null, handler)
+        } catch (e: Exception) {
+            log("Ошибка возврата превью: $e")
+        }
+    }
+
+    private fun startRecordingPersistent() {
+        val cam = device
+        val sess = session
+        val ps = persistentSurface
+        val pv = previewSurface
+        if (cam == null || sess == null || ps == null || pv == null) { startRecordingLegacy(); return }
+        try {
+            val values = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, "macro_" + System.currentTimeMillis() + ".mp4")
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/MacroCam")
+            }
+            val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+            if (uri == null) { log("Не удалось создать файл видео"); return }
+            val fd = contentResolver.openFileDescriptor(uri, "w")
+            if (fd == null) { log("Не удалось открыть файл видео"); return }
+            pfd = fd
+
+            val fixed = bitrates[bitrateIdx]
+            val br = if (fixed > 0) fixed * 1_000_000
+            else (videoSize.width.toLong() * videoSize.height * 30 * 0.15).toLong()
+                .coerceIn(8_000_000L, 50_000_000L).toInt()
+            val r = MediaRecorder()
+            r.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            r.setOutputFile(fd.fileDescriptor)
+            r.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            r.setVideoEncodingBitRate(br)
+            r.setVideoFrameRate(30)
+            r.setVideoSize(videoSize.width, videoSize.height)
+            r.setOrientationHint(outputRotation())
+            r.setInputSurface(ps)
+            r.prepare()
+            recorder = r
+
+            val rb = cam.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+            rb.addTarget(pv)
+            rb.addTarget(ps)
+            applyControls(rb, true)
+            builder = rb
+            sess.setRepeatingRequest(rb.build(), null, handler)
+            r.start()
+            recording = true
+            recordingPersistent = true
+            btnRec.text = "Стоп"
+            log("ЗАПИСЬ ИДЁТ: " + videoSize.width + "x" + videoSize.height + ", " + (br / 1_000_000) + " Мбит/с")
+        } catch (e: Exception) {
+            log("Ошибка записи: $e")
+            cleanupRecorder()
+            recording = false
+            recordingPersistent = false
+            btnRec.text = "Запись"
+            restorePreview()
+        }
+    }
+
+    private fun stopRecordingPersistent() {
+        restorePreview()
+        try { recorder?.stop() } catch (e: Exception) { log("stop: $e") }
+        cleanupRecorder()
+        recording = false
+        recordingPersistent = false
+        btnRec.text = "Запись"
+        log("Видео сохранено: Movies/MacroCam")
+    }
+
+    private fun startRecordingLegacy() {
         val cam = device
         if (cam == null) { log("Сначала откройте камеру"); return }
         if (stacking) { log("Идёт долгая выдержка"); return }
@@ -1055,6 +1284,7 @@ class MainActivity : Activity() {
 
             try { session?.close() } catch (_: Exception) {}
             session = null
+            sessionHasRecorder = false
             cam.createCaptureSession(listOf(pSurface, rSurface), object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     session = s
@@ -1081,6 +1311,7 @@ class MainActivity : Activity() {
     }
 
     private fun stopRecording() {
+        if (recordingPersistent) { stopRecordingPersistent(); return }
         try { session?.stopRepeating() } catch (_: Exception) {}
         try { session?.abortCaptures() } catch (_: Exception) {}
         try { recorder?.stop() } catch (e: Exception) { log("stop: $e") }
