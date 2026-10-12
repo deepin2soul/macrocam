@@ -6,6 +6,7 @@ import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ContentValues
+import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
@@ -104,6 +105,19 @@ class MainActivity : Activity() {
     private var maxZoom: Float = 1f
     private var streamMap: StreamConfigurationMap? = null
     private var aspectMode = 0
+    private lateinit var btnPause: Button
+    private lateinit var btnGallery: Button
+    private lateinit var btnTorch: Button
+    private lateinit var btnSave: Button
+    private lateinit var saveOverlay: FrameLayout
+    private var paused = false
+    private var torchOn = false
+    private var torchId: String? = null
+    private var torchCb: CameraManager.TorchCallback? = null
+    private var saveMode = false
+    private var lastTap = 0L
+    private var lastMediaUri: Uri? = null
+    private var lastMediaMime: String? = null
     private var videoUri: Uri? = null
     private var videoInfo: String? = null
     private var pendingInfo: String? = null
@@ -216,6 +230,9 @@ class MainActivity : Activity() {
         btnPhoto = mkBtn("Фото")
         btnStack = mkBtn("Долгая")
         btnRec = mkBtn("Запись")
+        btnPause = mkBtn("Пауза")
+        btnPause.visibility = View.GONE
+        btnGallery = mkBtn("Галерея")
         val left = LinearLayout(this)
         left.orientation = LinearLayout.VERTICAL
         left.addView(btnPanel)
@@ -223,11 +240,15 @@ class MainActivity : Activity() {
         left.addView(btnPhoto)
         left.addView(btnStack)
         left.addView(btnRec)
+        left.addView(btnPause)
+        left.addView(btnGallery)
         val leftLp = FrameLayout.LayoutParams(wrap, wrap, Gravity.START or Gravity.CENTER_VERTICAL)
         leftLp.leftMargin = dp(8)
         root.addView(left, leftLp)
 
         // правая панель настроек
+        btnTorch = mkBtn("Фонарик: выкл")
+        btnSave = mkBtn("Экономия (чёрный экран)")
         btnAspect = mkBtn("Формат: 4:3")
         cbFlip = mkCb("Перевернуть 180°")
         tvZoom = mkTv("Зум")
@@ -253,6 +274,8 @@ class MainActivity : Activity() {
 
         val col = LinearLayout(this)
         col.orientation = LinearLayout.VERTICAL
+        col.addView(btnTorch)
+        col.addView(btnSave)
         col.addView(btnAspect)
         col.addView(cbFlip)
         col.addView(tvZoom)
@@ -291,6 +314,22 @@ class MainActivity : Activity() {
         val logLp = FrameLayout.LayoutParams(dp(380), dp(64), Gravity.BOTTOM or Gravity.START)
         logLp.leftMargin = dp(96)
         root.addView(logScroll, logLp)
+
+        // чёрный экран для экономии батареи (поверх всего)
+        saveOverlay = FrameLayout(this)
+        saveOverlay.setBackgroundColor(Color.BLACK)
+        saveOverlay.visibility = View.GONE
+        saveOverlay.isClickable = true
+        val hint = TextView(this)
+        hint.text = "Экономия: нажмите дважды, чтобы выйти"
+        hint.setTextColor(Color.rgb(60, 60, 60))
+        hint.textSize = 12f
+        saveOverlay.addView(hint, FrameLayout.LayoutParams(wrap, wrap, Gravity.CENTER))
+        root.addView(saveOverlay, FrameLayout.LayoutParams(match, match))
+        saveOverlay.setOnClickListener {
+            val now = System.currentTimeMillis()
+            if (now - lastTap < 600) setSaveMode(false) else lastTap = now
+        }
 
         setContentView(root)
     }
@@ -370,9 +409,14 @@ class MainActivity : Activity() {
         sbBoost.setOnSeekBarChangeListener(seekListener)
         btnStack.setOnClickListener { startStack() }
         btnMode.setOnClickListener { toggleMode() }
+        btnPause.setOnClickListener { togglePause() }
+        btnGallery.setOnClickListener { openGallery() }
+        btnTorch.setOnClickListener { toggleTorch() }
+        btnSave.setOnClickListener { setSaveMode(true) }
         val tapViews = listOf<View>(
             btnPanel, btnMode, btnPhoto, btnStack, btnRec,
-            btnAspect, btnNr, btnEdge, btnBitrate, cbExp, cbFocus, cbFlip, cbStackSum
+            btnAspect, btnNr, btnEdge, btnBitrate, cbExp, cbFocus, cbFlip, cbStackSum,
+            btnPause, btnGallery, btnTorch, btnSave
         )
         for (v in tapViews) {
             v.setOnTouchListener { vv, ev ->
@@ -427,9 +471,25 @@ class MainActivity : Activity() {
         }
         updateLabels()
 
+        val need = ArrayList<String>()
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.CAMERA), 1)
+            need.add(Manifest.permission.CAMERA)
         }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            need.add(Manifest.permission.RECORD_AUDIO)
+        }
+        if (need.isNotEmpty()) requestPermissions(need.toTypedArray(), 1)
+
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        torchCb = object : CameraManager.TorchCallback() {
+            override fun onTorchModeChanged(cameraId: String, enabled: Boolean) {
+                if (cameraId == torchId) {
+                    torchOn = enabled
+                    runOnUiThread { btnTorch.text = if (enabled) "Фонарик: вкл" else "Фонарик: выкл" }
+                }
+            }
+        }
+        try { cm.registerTorchCallback(torchCb!!, handler) } catch (_: Exception) {}
     }
 
     private fun savePrefs() {
@@ -622,6 +682,8 @@ class MainActivity : Activity() {
         val u = videoUri
         val info = videoInfo
         if (u != null && info != null) embedMp4Comment(u, info)
+        if (u != null) rememberLast(u, "video/mp4")
+        paused = false
         videoUri = null
         videoInfo = null
     }
@@ -990,6 +1052,102 @@ class MainActivity : Activity() {
         btnPhoto.visibility = if (photo) View.VISIBLE else View.GONE
         btnStack.visibility = if (photo) View.VISIBLE else View.GONE
         btnRec.visibility = if (photo) View.GONE else View.VISIBLE
+        updatePauseUi()
+    }
+
+    private fun updatePauseUi() {
+        runOnUiThread {
+            btnPause.visibility = if (mode == 1 && recording) View.VISIBLE else View.GONE
+            btnPause.text = if (paused) "Продолжить" else "Пауза"
+        }
+    }
+
+    private fun togglePause() {
+        val r = recorder
+        if (!recording || r == null) { log("Запись не идёт"); return }
+        try {
+            if (paused) {
+                r.resume()
+                paused = false
+                log("Запись продолжена")
+            } else {
+                r.pause()
+                paused = true
+                log("Пауза")
+            }
+        } catch (e: Exception) {
+            log("Пауза недоступна: $e")
+        }
+        updatePauseUi()
+    }
+
+    // ---------- галерея, фонарик, экономия ----------
+
+    private fun rememberLast(uri: Uri, mime: String) {
+        lastMediaUri = uri
+        lastMediaMime = mime
+        prefs.edit().putString("lastUri", uri.toString()).putString("lastMime", mime).apply()
+    }
+
+    private fun openGallery() {
+        if (recording || stacking) { log("Сначала остановите запись или долгую выдержку"); return }
+        val u = lastMediaUri ?: prefs.getString("lastUri", null)?.let { Uri.parse(it) }
+        val mime = lastMediaMime ?: prefs.getString("lastMime", null)
+        try {
+            if (u != null) {
+                val i = Intent(Intent.ACTION_VIEW)
+                i.setDataAndType(u, mime ?: "*/*")
+                i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                startActivity(i)
+            } else {
+                startActivity(Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_GALLERY))
+            }
+        } catch (e: Exception) {
+            log("Не удалось открыть галерею: $e")
+        }
+    }
+
+    private fun findTorchId(): String? {
+        try {
+            for (id in cm.cameraIdList) {
+                val c = cm.getCameraCharacteristics(id)
+                if (c.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true &&
+                    c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+                ) return id
+            }
+        } catch (e: Exception) {
+            log("Поиск вспышки: $e")
+        }
+        return null
+    }
+
+    private fun toggleTorch() {
+        var id = torchId
+        if (id == null) {
+            id = findTorchId()
+            torchId = id
+        }
+        if (id == null) { log("Вспышка не найдена"); return }
+        try {
+            cm.setTorchMode(id, !torchOn)
+            torchOn = !torchOn
+            btnTorch.text = if (torchOn) "Фонарик: вкл" else "Фонарик: выкл"
+        } catch (e: Exception) {
+            log("Фонарик не включился: $e")
+        }
+    }
+
+    private fun setSaveMode(on: Boolean) {
+        saveMode = on
+        saveOverlay.visibility = if (on) View.VISIBLE else View.GONE
+        val lp = window.attributes
+        lp.screenBrightness = if (on) 0.01f else WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+        window.attributes = lp
+        log(if (on) "Экономия включена" else "Экономия выключена")
+    }
+
+    override fun onBackPressed() {
+        if (saveMode) setSaveMode(false) else super.onBackPressed()
     }
 
     private fun toggleMode() {
@@ -1221,6 +1379,7 @@ class MainActivity : Activity() {
                     }
                 }
             }
+            rememberLast(uri, "image/jpeg")
             log("Фото сохранено: Pictures/MacroCam")
         } catch (e: Exception) {
             log("Ошибка сохранения фото: $e")
@@ -1512,9 +1671,16 @@ class MainActivity : Activity() {
             else (videoSize.width.toLong() * videoSize.height * 30 * 0.15).toLong()
                 .coerceIn(8_000_000L, 50_000_000L).toInt()
             val r = MediaRecorder()
+            val withAudio = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+            if (withAudio) r.setAudioSource(MediaRecorder.AudioSource.MIC) else log("Нет разрешения на микрофон, запись без звука")
             r.setVideoSource(MediaRecorder.VideoSource.SURFACE)
             r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             r.setOutputFile(fd.fileDescriptor)
+            if (withAudio) {
+                r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                r.setAudioEncodingBitRate(128_000)
+                r.setAudioSamplingRate(44_100)
+            }
             r.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
             r.setVideoEncodingBitRate(br)
             r.setVideoFrameRate(30)
@@ -1534,6 +1700,7 @@ class MainActivity : Activity() {
             recording = true
             recordingPersistent = true
             btnRec.text = "Стоп"
+            updatePauseUi()
             log("ЗАПИСЬ ИДЁТ: " + videoSize.width + "x" + videoSize.height + ", " + (br / 1_000_000) + " Мбит/с")
         } catch (e: Exception) {
             log("Ошибка записи: $e")
@@ -1541,6 +1708,7 @@ class MainActivity : Activity() {
             recording = false
             recordingPersistent = false
             btnRec.text = "Запись"
+            updatePauseUi()
             restorePreview()
         }
     }
@@ -1553,6 +1721,7 @@ class MainActivity : Activity() {
         recording = false
         recordingPersistent = false
         btnRec.text = "Запись"
+        updatePauseUi()
         log("Видео сохранено: Movies/MacroCam")
     }
 
@@ -1578,9 +1747,16 @@ class MainActivity : Activity() {
             for (sz in cands) {
                 val t = MediaRecorder()
                 try {
+                    val withAudio = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                    if (withAudio) t.setAudioSource(MediaRecorder.AudioSource.MIC)
                     t.setVideoSource(MediaRecorder.VideoSource.SURFACE)
                     t.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
                     t.setOutputFile(fd.fileDescriptor)
+                    if (withAudio) {
+                        t.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                        t.setAudioEncodingBitRate(128_000)
+                        t.setAudioSamplingRate(44_100)
+                    }
                     t.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
                     val fixed = bitrates[bitrateIdx]
                     val br = if (fixed > 0) fixed * 1_000_000
@@ -1629,6 +1805,7 @@ class MainActivity : Activity() {
                         rec.start()
                         recording = true
                         runOnUiThread { btnRec.text = "Стоп" }
+                        updatePauseUi()
                         log("ЗАПИСЬ ИДЁТ")
                     } catch (e: Exception) {
                         log("Ошибка старта записи: $e")
@@ -1655,6 +1832,7 @@ class MainActivity : Activity() {
         finishVideoFile()
         recording = false
         btnRec.text = "Запись"
+        updatePauseUi()
         log("Видео сохранено: Movies/MacroCam")
         startPreview()
     }
@@ -1699,6 +1877,7 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         savePrefs()
+        if (saveMode) setSaveMode(false)
         if (stacking) {
             stacking = false
             cleanupStack()
@@ -1709,6 +1888,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        try { torchCb?.let { cm.unregisterTorchCallback(it) } } catch (_: Exception) {}
         closeAll()
         thread.quitSafely()
         super.onDestroy()
