@@ -18,6 +18,9 @@ import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.CamcorderProfile
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
 import android.media.ExifInterface
 import android.media.MediaCodec
 import android.media.Image
@@ -32,18 +35,33 @@ import android.provider.MediaStore
 import android.util.Range
 import android.util.Size
 import android.view.Surface
+import android.net.Uri
+import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
 import android.view.TextureView
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
+import android.content.res.ColorStateList
+import android.graphics.Color
+import android.view.Gravity
+import android.view.ViewGroup
 import android.widget.Button
+import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import java.io.ByteArrayOutputStream
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.io.File
 import kotlin.math.max
 import kotlin.math.min
@@ -86,8 +104,17 @@ class MainActivity : Activity() {
     private var maxZoom: Float = 1f
     private var streamMap: StreamConfigurationMap? = null
     private var aspectMode = 0
+    private var videoUri: Uri? = null
+    private var videoInfo: String? = null
+    private var pendingInfo: String? = null
+    private var pendingExpSec: Double? = null
+    private var pendingIso: Int? = null
+    private var pendingDist: Double? = null
+    private var pendingTag: String? = null
+    private var stackFrameExpNs: Long = 0L
     private var mode = 0 // 0 = фото, 1 = видео
     private lateinit var btnMode: Button
+    private lateinit var btnPhoto: Button
     private var persistentSurface: Surface? = null
     private var previewSurface: Surface? = null
     private var previewBuilder: CaptureRequest.Builder? = null
@@ -104,7 +131,6 @@ class MainActivity : Activity() {
     private lateinit var btnEdge: Button
     private var nrMode = -1
     private var edgeMode = -1
-    private lateinit var cbNoProc: CheckBox
     private lateinit var btnBitrate: Button
     private val bitrates = intArrayOf(0, 20, 40, 80)
     private var bitrateIdx = 0
@@ -142,6 +168,133 @@ class MainActivity : Activity() {
     private var pfd: ParcelFileDescriptor? = null
     @Volatile private var recording = false
 
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    private fun mkBtn(label: String): Button {
+        val b = Button(this)
+        b.text = label
+        return b
+    }
+
+    private fun mkTv(label: String): TextView {
+        val t = TextView(this)
+        t.text = label
+        t.setTextColor(Color.WHITE)
+        return t
+    }
+
+    private fun mkCb(label: String, checked: Boolean = false): CheckBox {
+        val c = CheckBox(this)
+        c.text = label
+        c.setTextColor(Color.WHITE)
+        c.buttonTintList = ColorStateList.valueOf(Color.WHITE)
+        c.isChecked = checked
+        return c
+    }
+
+    private fun mkSb(maxValue: Int, progressValue: Int): SeekBar {
+        val sb = SeekBar(this)
+        sb.max = maxValue
+        sb.progress = progressValue
+        return sb
+    }
+
+    // Весь интерфейс создаётся здесь, в коде, поэтому xml-файл разметки больше не нужен
+    private fun buildUi() {
+        val match = ViewGroup.LayoutParams.MATCH_PARENT
+        val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+
+        val root = FrameLayout(this)
+        root.setBackgroundColor(Color.BLACK)
+
+        texture = TextureView(this)
+        root.addView(texture, FrameLayout.LayoutParams(match, match))
+
+        // левая колонка, всегда на экране
+        btnPanel = mkBtn("Панель")
+        btnMode = mkBtn("Режим: Фото")
+        btnPhoto = mkBtn("Фото")
+        btnStack = mkBtn("Долгая")
+        btnRec = mkBtn("Запись")
+        val left = LinearLayout(this)
+        left.orientation = LinearLayout.VERTICAL
+        left.addView(btnPanel)
+        left.addView(btnMode)
+        left.addView(btnPhoto)
+        left.addView(btnStack)
+        left.addView(btnRec)
+        val leftLp = FrameLayout.LayoutParams(wrap, wrap, Gravity.START or Gravity.CENTER_VERTICAL)
+        leftLp.leftMargin = dp(8)
+        root.addView(left, leftLp)
+
+        // правая панель настроек
+        btnAspect = mkBtn("Формат: 4:3")
+        cbFlip = mkCb("Перевернуть 180°")
+        tvZoom = mkTv("Зум")
+        sbZoom = mkSb(1000, 0)
+        cbExp = mkCb("Ручные ISO и выдержка")
+        tvIso = mkTv("ISO")
+        sbIso = mkSb(1000, 200)
+        tvExp = mkTv("Выдержка")
+        sbExp = mkSb(1000, 500)
+        cbFocus = mkCb("Ручной фокус")
+        tvFocus = mkTv("Фокус")
+        sbFocus = mkSb(1000, 200)
+        tvBoost = mkTv("Цифровое усиление")
+        tvBoost.visibility = View.GONE
+        sbBoost = mkSb(1000, 0)
+        sbBoost.visibility = View.GONE
+        tvStack = mkTv("Долгая выдержка")
+        sbStack = mkSb(118, 28)
+        cbStackSum = mkCb("Суммировать (ярче); выкл. = среднее", true)
+        btnNr = mkBtn("Шумоподавление: авто")
+        btnEdge = mkBtn("Контуры: авто")
+        btnBitrate = mkBtn("Битрейт: авто")
+
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.addView(btnAspect)
+        col.addView(cbFlip)
+        col.addView(tvZoom)
+        col.addView(sbZoom)
+        col.addView(cbExp)
+        col.addView(tvIso)
+        col.addView(sbIso)
+        col.addView(tvExp)
+        col.addView(sbExp)
+        col.addView(cbFocus)
+        col.addView(tvFocus)
+        col.addView(sbFocus)
+        col.addView(tvBoost)
+        col.addView(sbBoost)
+        col.addView(tvStack)
+        col.addView(sbStack)
+        col.addView(cbStackSum)
+        col.addView(btnNr)
+        col.addView(btnEdge)
+        col.addView(btnBitrate)
+
+        val panelScroll = ScrollView(this)
+        panelScroll.setBackgroundColor(Color.argb(0x99, 0, 0, 0))
+        panelScroll.setPadding(dp(8), dp(8), dp(8), dp(8))
+        panelScroll.addView(col)
+        panel = panelScroll
+        root.addView(panelScroll, FrameLayout.LayoutParams(dp(320), match, Gravity.END))
+
+        // лог внизу слева
+        logView = TextView(this)
+        logView.setTextColor(Color.WHITE)
+        logView.textSize = 11f
+        logScroll = ScrollView(this)
+        logScroll.setBackgroundColor(Color.argb(0x66, 0, 0, 0))
+        logScroll.addView(logView)
+        val logLp = FrameLayout.LayoutParams(dp(380), dp(64), Gravity.BOTTOM or Gravity.START)
+        logLp.leftMargin = dp(96)
+        root.addView(logScroll, logLp)
+
+        setContentView(root)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
@@ -151,40 +304,11 @@ class MainActivity : Activity() {
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
             window.attributes = lp
         }
-        setContentView(R.layout.activity_main)
+        buildUi()
         hideSystemUi()
 
         prefs = getSharedPreferences("macro", MODE_PRIVATE)
         cm = getSystemService(CAMERA_SERVICE) as CameraManager
-        texture = findViewById(R.id.texture)
-        logView = findViewById(R.id.log)
-        logScroll = findViewById(R.id.logScroll)
-        sbIso = findViewById(R.id.sbIso)
-        sbExp = findViewById(R.id.sbExp)
-        sbFocus = findViewById(R.id.sbFocus)
-        tvIso = findViewById(R.id.tvIso)
-        tvExp = findViewById(R.id.tvExp)
-        tvFocus = findViewById(R.id.tvFocus)
-        cbExp = findViewById(R.id.cbExp)
-        cbFocus = findViewById(R.id.cbFocus)
-        cbFlip = findViewById(R.id.cbFlip)
-        btnRec = findViewById(R.id.btnRec)
-        btnAspect = findViewById(R.id.btnAspect)
-        panel = findViewById(R.id.panel)
-        btnPanel = findViewById(R.id.btnPanel)
-        sbZoom = findViewById(R.id.sbZoom)
-        btnStack = findViewById(R.id.btnStack)
-        btnMode = findViewById(R.id.btnMode)
-        btnNr = findViewById(R.id.btnNr)
-        btnEdge = findViewById(R.id.btnEdge)
-        cbNoProc = findViewById(R.id.cbNoProc)
-        btnBitrate = findViewById(R.id.btnBitrate)
-        sbStack = findViewById(R.id.sbStack)
-        tvStack = findViewById(R.id.tvStack)
-        cbStackSum = findViewById(R.id.cbStackSum)
-        sbBoost = findViewById(R.id.sbBoost)
-        tvBoost = findViewById(R.id.tvBoost)
-        tvZoom = findViewById(R.id.tvZoom)
         thread = HandlerThread("cam").also { it.start() }
         handler = Handler(thread.looper)
 
@@ -200,7 +324,6 @@ class MainActivity : Activity() {
         nrMode = prefs.getInt("nrMode", -1)
         edgeMode = prefs.getInt("edgeMode", -1)
         updateModeButtons()
-        cbNoProc.isChecked = prefs.getBoolean("noProc", false)
         bitrateIdx = prefs.getInt("bitrate", 0).coerceIn(0, bitrates.size - 1)
         btnBitrate.text = bitrateLabel()
         cbExp.isChecked = prefs.getBoolean("manExp", false)
@@ -223,7 +346,7 @@ class MainActivity : Activity() {
             override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
         }
 
-        findViewById<Button>(R.id.btnPhoto).setOnClickListener { takePhoto() }
+        btnPhoto.setOnClickListener { takePhoto() }
         btnRec.setOnClickListener {
             if (recording) stopRecording() else startRecording()
         }
@@ -247,6 +370,21 @@ class MainActivity : Activity() {
         sbBoost.setOnSeekBarChangeListener(seekListener)
         btnStack.setOnClickListener { startStack() }
         btnMode.setOnClickListener { toggleMode() }
+        val tapViews = listOf<View>(
+            btnPanel, btnMode, btnPhoto, btnStack, btnRec,
+            btnAspect, btnNr, btnEdge, btnBitrate, cbExp, cbFocus, cbFlip, cbStackSum
+        )
+        for (v in tapViews) {
+            v.setOnTouchListener { vv, ev ->
+                if (ev.action == MotionEvent.ACTION_DOWN) {
+                    vv.performHapticFeedback(
+                        HapticFeedbackConstants.KEYBOARD_TAP,
+                        HapticFeedbackConstants.FLAG_IGNORE_GLOBAL_SETTING
+                    )
+                }
+                false
+            }
+        }
         btnNr.setOnClickListener {
             nrMode = nextMode(
                 nrMode,
@@ -267,7 +405,6 @@ class MainActivity : Activity() {
             savePrefs()
             updateRepeating()
         }
-        cbNoProc.setOnCheckedChangeListener { _, _ -> savePrefs(); updateRepeating() }
         btnBitrate.setOnClickListener {
             if (recording) {
                 log("Битрейт нельзя менять во время записи")
@@ -310,7 +447,6 @@ class MainActivity : Activity() {
             .putInt("nrMode", nrMode)
             .putInt("mode", mode)
             .putInt("edgeMode", edgeMode)
-            .putBoolean("noProc", cbNoProc.isChecked)
             .putInt("bitrate", bitrateIdx)
             .putInt("aspect", aspectMode)
             .apply()
@@ -321,6 +457,173 @@ class MainActivity : Activity() {
             logView.append(s + "\n")
             logScroll.post { logScroll.fullScroll(ScrollView.FOCUS_DOWN) }
         }
+    }
+
+    // ---------- метаданные и звук ----------
+
+    private fun stamp(): String =
+        SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+
+    private fun nrTag(m: Int): String =
+        if (m < 0) "auto" else arrayOf("off", "fast", "hq", "min", "zsl").getOrElse(m) { m.toString() }
+
+    private fun edgeTag(m: Int): String =
+        if (m < 0) "auto" else arrayOf("off", "fast", "hq", "zsl").getOrElse(m) { m.toString() }
+
+    private fun fmtExp(ns: Long): String =
+        if (ns >= 300_000_000L) String.format(Locale.US, "%.2f s", ns / 1e9)
+        else "1/" + (1_000_000_000.0 / ns).toInt() + " s"
+
+    private fun tagExp(ns: Long): String =
+        if (ns >= 300_000_000L) String.format(Locale.US, "%.2fs", ns / 1e9)
+        else "1-" + (1_000_000_000.0 / ns).toInt() + "s"
+
+    private fun focusText(): String {
+        if (!cbFocus.isChecked) return "auto"
+        val f = currentFocus()
+        return if (f < 0.01f) "infinity" else String.format(Locale.US, "%.1f cm (%.1f D)", 100f / f, f)
+    }
+
+    private fun shotInfo(longFrames: Int = 0, frameExpNs: Long = 0L): String {
+        val sb = StringBuilder("Exposure ")
+        if (longFrames > 0) {
+            sb.append(String.format(Locale.US, "%.1f s total (%d frames x %s)",
+                longFrames * frameExpNs / 1e9, longFrames, fmtExp(frameExpNs)))
+        } else {
+            sb.append(if (cbExp.isChecked) fmtExp(currentExp()) else "auto")
+        }
+        sb.append("; ISO ").append(if (cbExp.isChecked) currentIso().toString() else "auto")
+        val br = boostRange
+        sb.append("; digital gain ")
+            .append(if (cbExp.isChecked && br != null && br.upper > 100) currentBoost().toString() + "%" else "none")
+        sb.append("; noise reduction ").append(nrTag(nrMode))
+        sb.append("; edge ").append(edgeTag(edgeMode))
+        sb.append("; focus ").append(focusText())
+        sb.append("; zoom ").append(String.format(Locale.US, "%.1fx", currentZoom()))
+        return sb.toString()
+    }
+
+    private fun fileTag(longFrames: Int = 0, frameExpNs: Long = 0L): String {
+        val sb = StringBuilder()
+        if (longFrames > 0) {
+            sb.append("long").append(String.format(Locale.US, "%.0fs", longFrames * frameExpNs / 1e9))
+                .append("_").append(longFrames).append("x").append(tagExp(frameExpNs))
+        } else {
+            sb.append("exp").append(if (cbExp.isChecked) tagExp(currentExp()) else "auto")
+        }
+        sb.append("_ISO").append(if (cbExp.isChecked) currentIso().toString() else "auto")
+        val br = boostRange
+        if (cbExp.isChecked && br != null && br.upper > 100) sb.append("_G").append(currentBoost())
+        sb.append("_NR").append(nrTag(nrMode))
+        sb.append("_ED").append(edgeTag(edgeMode))
+        val f = currentFocus()
+        sb.append("_F").append(
+            if (!cbFocus.isChecked) "auto"
+            else if (f < 0.01f) "inf"
+            else String.format(Locale.US, "%.1fcm", 100f / f)
+        )
+        return sb.toString()
+    }
+
+    private fun videoName(): String {
+        videoInfo = shotInfo()
+        return "macro_" + stamp() + "_" + fileTag()
+    }
+
+    private fun beep() {
+        Thread {
+            try {
+                val sr = 44100
+                val n = sr * 80 / 1000
+                val data = ShortArray(n)
+                for (i in 0 until n) {
+                    val fade = min(1.0, min(i, n - i) / (sr * 0.005))
+                    data[i] = (Math.sin(2.0 * Math.PI * 1000.0 * i / sr) * 12000.0 * fade).toInt().toShort()
+                }
+                val track = AudioTrack.Builder()
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                            .build()
+                    )
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(sr)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(n * 2)
+                    .setTransferMode(AudioTrack.MODE_STATIC)
+                    .build()
+                track.write(data, 0, n)
+                track.play()
+                Thread.sleep(200)
+                track.release()
+            } catch (_: Exception) {
+            }
+        }.start()
+    }
+
+    // Записывает текст в MP4 как атом ©cmt внутри udta (в конец moov), только если moov стоит в конце файла
+    private fun embedMp4Comment(uri: Uri, text: String) {
+        try {
+            val rw = contentResolver.openFileDescriptor(uri, "rw")
+            if (rw == null) { log("Видео: не удалось открыть файл для метаданных"); return }
+            rw.use { p ->
+                val inCh = FileInputStream(p.fileDescriptor).channel
+                val outCh = FileOutputStream(p.fileDescriptor).channel
+                val len = inCh.size()
+                var pos = 0L
+                var moovPos = -1L
+                var moovSize = 0L
+                val hdr = ByteBuffer.allocate(8)
+                while (pos + 8 <= len) {
+                    hdr.clear()
+                    if (inCh.read(hdr, pos) < 8) break
+                    hdr.flip()
+                    val size32 = hdr.int.toLong() and 0xFFFFFFFFL
+                    val type = hdr.int
+                    if (size32 < 8) break
+                    if (type == 0x6D6F6F76) { moovPos = pos; moovSize = size32 }
+                    pos += size32
+                }
+                if (moovPos < 0 || moovPos + moovSize != len) {
+                    log("Видео: метаданные в файл не записаны (нестандартная структура), они есть в имени файла")
+                    return@use
+                }
+                val bytes = text.toByteArray(Charsets.US_ASCII)
+                val cmtSize = 8 + 4 + bytes.size
+                val udtaSize = 8 + cmtSize
+                val buf = ByteBuffer.allocate(udtaSize)
+                buf.putInt(udtaSize)
+                buf.putInt(0x75647461)
+                buf.putInt(cmtSize)
+                buf.putInt(0xA9636D74L.toInt())
+                buf.putShort(bytes.size.toShort())
+                buf.putShort(0x15C7.toShort())
+                buf.put(bytes)
+                buf.flip()
+                val newMoov = ByteBuffer.allocate(4)
+                newMoov.putInt((moovSize + udtaSize).toInt())
+                newMoov.flip()
+                outCh.write(buf, len)
+                outCh.write(newMoov, moovPos)
+                log("Видео: параметры записаны в файл (комментарий) и в имя")
+            }
+        } catch (e: Exception) {
+            log("Видео: метаданные не записаны: $e")
+        }
+    }
+
+    private fun finishVideoFile() {
+        beep()
+        val u = videoUri
+        val info = videoInfo
+        if (u != null && info != null) embedMp4Comment(u, info)
+        videoUri = null
+        videoInfo = null
     }
 
     // ---------- значения ползунков ----------
@@ -432,18 +735,6 @@ class MainActivity : Activity() {
             val e = c.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES)
             if (e != null && e.contains(edgeMode)) {
                 b.set(CaptureRequest.EDGE_MODE, edgeMode)
-            }
-        }
-        if (cbNoProc.isChecked) {
-            val v = c.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
-            if (v != null && v.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)) {
-                b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                    CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
-            }
-            val o = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
-            if (o != null && o.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF)) {
-                b.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                    CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF)
             }
         }
     }
@@ -623,7 +914,7 @@ class MainActivity : Activity() {
                     val buf = img.planes[0].buffer
                     val bytes = ByteArray(buf.remaining())
                     buf.get(bytes)
-                    savePhoto(bytes)
+                    savePhoto(bytes, -1, pendingInfo, pendingExpSec, pendingIso, pendingDist, pendingTag)
                 } finally {
                     img.close()
                 }
@@ -696,7 +987,7 @@ class MainActivity : Activity() {
     private fun updateModeUi() {
         btnMode.text = if (mode == 0) "Режим: Фото" else "Режим: Видео"
         val photo = mode == 0
-        findViewById<View>(R.id.btnPhoto).visibility = if (photo) View.VISIBLE else View.GONE
+        btnPhoto.visibility = if (photo) View.VISIBLE else View.GONE
         btnStack.visibility = if (photo) View.VISIBLE else View.GONE
         btnRec.visibility = if (photo) View.GONE else View.VISIBLE
     }
@@ -849,6 +1140,12 @@ class MainActivity : Activity() {
         if (mode != 0) { log("Переключите режим на «Фото»"); return }
         if (rampActive) { log("Подождите, линза встаёт на место"); return }
         try {
+            pendingInfo = shotInfo()
+            pendingTag = fileTag()
+            pendingExpSec = if (cbExp.isChecked) currentExp() / 1e9 else null
+            pendingIso = if (cbExp.isChecked) currentIso() else null
+            val fNow = currentFocus()
+            pendingDist = if (cbFocus.isChecked && fNow > 0.01f) 1.0 / fNow else null
             val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             b.addTarget(reader.surface)
             applyControls(b, false)
@@ -874,28 +1171,52 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun savePhoto(bytes: ByteArray, rotation: Int = -1) {
+    private fun savePhoto(
+        bytes: ByteArray,
+        rotation: Int = -1,
+        info: String? = null,
+        expSec: Double? = null,
+        iso: Int? = null,
+        distM: Double? = null,
+        tag: String? = null
+    ) {
         try {
+            val name = "macro_" + stamp() + (if (tag != null) "_$tag" else "")
             val values = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, "macro_" + System.currentTimeMillis() + ".jpg")
+                put(MediaStore.Images.Media.DISPLAY_NAME, "$name.jpg")
                 put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
                 put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/MacroCam")
             }
             val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
             if (uri == null) { log("Не удалось создать файл фото"); return }
             contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
-            if (rotation >= 0) {
+            if (rotation >= 0 || info != null) {
                 val rw = contentResolver.openFileDescriptor(uri, "rw")
                 if (rw != null) {
                     rw.use {
                         val exif = ExifInterface(it.fileDescriptor)
-                        val o = when (rotation) {
-                            90 -> ExifInterface.ORIENTATION_ROTATE_90
-                            180 -> ExifInterface.ORIENTATION_ROTATE_180
-                            270 -> ExifInterface.ORIENTATION_ROTATE_270
-                            else -> ExifInterface.ORIENTATION_NORMAL
+                        if (rotation >= 0) {
+                            val o = when (rotation) {
+                                90 -> ExifInterface.ORIENTATION_ROTATE_90
+                                180 -> ExifInterface.ORIENTATION_ROTATE_180
+                                270 -> ExifInterface.ORIENTATION_ROTATE_270
+                                else -> ExifInterface.ORIENTATION_NORMAL
+                            }
+                            exif.setAttribute(ExifInterface.TAG_ORIENTATION, o.toString())
                         }
-                        exif.setAttribute(ExifInterface.TAG_ORIENTATION, o.toString())
+                        if (info != null) {
+                            exif.setAttribute(ExifInterface.TAG_USER_COMMENT, info)
+                            exif.setAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION, info)
+                        }
+                        if (expSec != null) {
+                            exif.setAttribute(ExifInterface.TAG_EXPOSURE_TIME, String.format(Locale.US, "%.6f", expSec))
+                        }
+                        if (iso != null) {
+                            exif.setAttribute(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, iso.toString())
+                        }
+                        if (distM != null) {
+                            exif.setAttribute(ExifInterface.TAG_SUBJECT_DISTANCE, String.format(Locale.US, "%.4f", distM))
+                        }
                         exif.saveAttributes()
                     }
                 }
@@ -953,6 +1274,7 @@ class MainActivity : Activity() {
             return
         }
         stackTarget = n
+        stackFrameExpNs = exp
         stackCount = 0
         stackCancel = false
         stackSum = cbStackSum.isChecked
@@ -1109,13 +1431,24 @@ class MainActivity : Activity() {
     private fun finishStack() {
         val n = stackCount
         stacking = false
+        beep()
         try {
             if (n == 0) {
                 log("Кадров нет")
             } else {
                 log("Обработка $n кадров...")
                 val jpeg = buildStackJpeg(n)
-                if (jpeg != null) savePhoto(jpeg, outputRotation()) else log("Нет данных")
+                if (jpeg != null) {
+                    val fNow = currentFocus()
+                    savePhoto(
+                        jpeg, outputRotation(),
+                        shotInfo(n, stackFrameExpNs),
+                        n * stackFrameExpNs / 1e9,
+                        if (cbExp.isChecked) currentIso() else null,
+                        if (cbFocus.isChecked && fNow > 0.01f) 1.0 / fNow else null,
+                        fileTag(n, stackFrameExpNs)
+                    )
+                } else log("Нет данных")
             }
         } catch (e: Throwable) {
             log("Ошибка обработки: $e")
@@ -1163,12 +1496,13 @@ class MainActivity : Activity() {
         if (cam == null || sess == null || ps == null || pv == null) { startRecordingLegacy(); return }
         try {
             val values = ContentValues().apply {
-                put(MediaStore.Video.Media.DISPLAY_NAME, "macro_" + System.currentTimeMillis() + ".mp4")
+                put(MediaStore.Video.Media.DISPLAY_NAME, videoName() + ".mp4")
                 put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
                 put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/MacroCam")
             }
             val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
             if (uri == null) { log("Не удалось создать файл видео"); return }
+            videoUri = uri
             val fd = contentResolver.openFileDescriptor(uri, "w")
             if (fd == null) { log("Не удалось открыть файл видео"); return }
             pfd = fd
@@ -1215,6 +1549,7 @@ class MainActivity : Activity() {
         restorePreview()
         try { recorder?.stop() } catch (e: Exception) { log("stop: $e") }
         cleanupRecorder()
+        finishVideoFile()
         recording = false
         recordingPersistent = false
         btnRec.text = "Запись"
@@ -1227,12 +1562,13 @@ class MainActivity : Activity() {
         if (stacking) { log("Идёт долгая выдержка"); return }
         try {
             val values = ContentValues().apply {
-                put(MediaStore.Video.Media.DISPLAY_NAME, "macro_" + System.currentTimeMillis() + ".mp4")
+                put(MediaStore.Video.Media.DISPLAY_NAME, videoName() + ".mp4")
                 put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
                 put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/MacroCam")
             }
             val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
             if (uri == null) { log("Не удалось создать файл видео"); return }
+            videoUri = uri
             val fd = contentResolver.openFileDescriptor(uri, "w")
             if (fd == null) { log("Не удалось открыть файл видео"); return }
             pfd = fd
@@ -1316,6 +1652,7 @@ class MainActivity : Activity() {
         try { session?.abortCaptures() } catch (_: Exception) {}
         try { recorder?.stop() } catch (e: Exception) { log("stop: $e") }
         cleanupRecorder()
+        finishVideoFile()
         recording = false
         btnRec.text = "Запись"
         log("Видео сохранено: Movies/MacroCam")
