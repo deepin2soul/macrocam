@@ -1212,7 +1212,7 @@ class MainActivity : Activity() {
                             exif.setAttribute(ExifInterface.TAG_EXPOSURE_TIME, String.format(Locale.US, "%.6f", expSec))
                         }
                         if (iso != null) {
-                            exif.setAttribute(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, iso.toString())
+                            exif.setAttribute("ISOSpeedRatings", iso.toString())
                         }
                         if (distM != null) {
                             exif.setAttribute(ExifInterface.TAG_SUBJECT_DISTANCE, String.format(Locale.US, "%.4f", distM))
