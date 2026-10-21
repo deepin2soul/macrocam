@@ -10,6 +10,7 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
@@ -56,7 +57,16 @@ import android.widget.EditText
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
+import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
+import java.io.InputStreamReader
+import java.io.OutputStream
+import java.net.ServerSocket
+import java.net.Socket
+import java.net.URLDecoder
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
@@ -105,6 +115,15 @@ class MainActivity : Activity() {
     private var maxZoom: Float = 1f
     private var streamMap: StreamConfigurationMap? = null
     private var aspectMode = 0
+    private lateinit var btnServer: Button
+    private val logBuf = ArrayList<String>()
+    private var serverSocket: ServerSocket? = null
+    @Volatile private var serverOn = false
+    private var pin = ""
+    private val clients = AtomicInteger(0)
+    @Volatile private var latestJpeg: ByteArray? = null
+    @Volatile private var frameSeq = 0L
+    private var streamBmp: Bitmap? = null
     private lateinit var btnPause: Button
     private lateinit var btnGallery: Button
     private lateinit var btnTorch: Button
@@ -247,6 +266,7 @@ class MainActivity : Activity() {
         root.addView(left, leftLp)
 
         // правая панель настроек
+        btnServer = mkBtn("Трансляция: выкл")
         btnTorch = mkBtn("Фонарик: выкл")
         btnSave = mkBtn("Экономия (чёрный экран)")
         btnAspect = mkBtn("Формат: 4:3")
@@ -274,6 +294,7 @@ class MainActivity : Activity() {
 
         val col = LinearLayout(this)
         col.orientation = LinearLayout.VERTICAL
+        col.addView(btnServer)
         col.addView(btnTorch)
         col.addView(btnSave)
         col.addView(btnAspect)
@@ -412,11 +433,12 @@ class MainActivity : Activity() {
         btnPause.setOnClickListener { togglePause() }
         btnGallery.setOnClickListener { openGallery() }
         btnTorch.setOnClickListener { toggleTorch() }
+        btnServer.setOnClickListener { toggleServer() }
         btnSave.setOnClickListener { setSaveMode(true) }
         val tapViews = listOf<View>(
             btnPanel, btnMode, btnPhoto, btnStack, btnRec,
             btnAspect, btnNr, btnEdge, btnBitrate, cbExp, cbFocus, cbFlip, cbStackSum,
-            btnPause, btnGallery, btnTorch, btnSave
+            btnPause, btnGallery, btnTorch, btnSave, btnServer
         )
         for (v in tapViews) {
             v.setOnTouchListener { vv, ev ->
@@ -513,6 +535,10 @@ class MainActivity : Activity() {
     }
 
     private fun log(s: String) {
+        synchronized(logBuf) {
+            logBuf.add(s)
+            if (logBuf.size > 40) logBuf.removeAt(0)
+        }
         runOnUiThread {
             logView.append(s + "\n")
             logScroll.post { logScroll.fullScroll(ScrollView.FOCUS_DOWN) }
@@ -1079,6 +1105,390 @@ class MainActivity : Activity() {
             log("Пауза недоступна: $e")
         }
         updatePauseUi()
+    }
+
+    // ---------- трансляция на планшет ----------
+
+    private fun recentLog(): String = synchronized(logBuf) { logBuf.takeLast(8).joinToString("\n") }
+
+    private fun esc(s: String): String =
+        s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", " ").replace("\t", " ")
+
+    private fun localIps(): List<String> {
+        val res = ArrayList<String>()
+        try {
+            val en = java.net.NetworkInterface.getNetworkInterfaces()
+            while (en.hasMoreElements()) {
+                val ni = en.nextElement()
+                if (!ni.isUp || ni.isLoopback) continue
+                val ad = ni.inetAddresses
+                while (ad.hasMoreElements()) {
+                    val a = ad.nextElement()
+                    if (a is java.net.Inet4Address && !a.isLoopbackAddress) {
+                        res.add("http://" + a.hostAddress + ":8080")
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return res
+    }
+
+    private fun toggleServer() {
+        if (serverOn) {
+            stopServer()
+            btnServer.text = "Трансляция: выкл"
+            log("Трансляция выключена")
+        } else {
+            startServer()
+        }
+    }
+
+    private fun startServer() {
+        if (serverOn) return
+        var p = prefs.getString("pin", null)
+        if (p == null) {
+            p = (1000 + java.util.Random().nextInt(9000)).toString()
+            prefs.edit().putString("pin", p).apply()
+        }
+        pin = p
+        try {
+            val ss = ServerSocket(8080)
+            serverSocket = ss
+            serverOn = true
+            Thread { acceptLoop(ss) }.start()
+            Thread { producerLoop() }.start()
+            btnServer.text = "Трансляция: вкл"
+            val ips = localIps()
+            val msg = (if (ips.isEmpty()) "Нет сети Wi-Fi или USB" else ips.joinToString("\n")) + "\n\nPIN: " + pin
+            AlertDialog.Builder(this)
+                .setTitle("Откройте на планшете")
+                .setMessage(msg)
+                .setPositiveButton("OK", null)
+                .show()
+            log("Трансляция: порт 8080, PIN $pin")
+        } catch (e: Exception) {
+            log("Сервер не запустился: $e")
+        }
+    }
+
+    private fun stopServer() {
+        serverOn = false
+        try { serverSocket?.close() } catch (_: Exception) {}
+        serverSocket = null
+    }
+
+    private fun acceptLoop(ss: ServerSocket) {
+        while (serverOn) {
+            try {
+                val s = ss.accept()
+                Thread { handleClient(s) }.start()
+            } catch (e: Exception) {
+                if (!serverOn) break
+            }
+        }
+    }
+
+    private fun writeHttp(out: OutputStream, code: Int, type: String, body: ByteArray) {
+        val head = "HTTP/1.1 " + code + " " + (if (code == 200) "OK" else "Error") +
+            "\r\nContent-Type: " + type +
+            "\r\nContent-Length: " + body.size +
+            "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+        out.write(head.toByteArray(Charsets.ISO_8859_1))
+        out.write(body)
+        out.flush()
+    }
+
+    private fun handleClient(sock: Socket) {
+        try {
+            sock.soTimeout = 10000
+            val input = BufferedReader(InputStreamReader(sock.getInputStream(), Charsets.ISO_8859_1))
+            val first = input.readLine() ?: return
+            while (true) {
+                val l = input.readLine() ?: break
+                if (l.isEmpty()) break
+            }
+            val parts = first.split(" ")
+            if (parts.size < 2) return
+            val target = parts[1]
+            val qi = target.indexOf('?')
+            val path = if (qi >= 0) target.substring(0, qi) else target
+            val params = HashMap<String, String>()
+            if (qi >= 0) {
+                for (kv in target.substring(qi + 1).split("&")) {
+                    val e = kv.indexOf('=')
+                    if (e > 0) {
+                        params[URLDecoder.decode(kv.substring(0, e), "UTF-8")] =
+                            URLDecoder.decode(kv.substring(e + 1), "UTF-8")
+                    }
+                }
+            }
+            val out = sock.getOutputStream()
+            if (path == "/") {
+                writeHttp(out, 200, "text/html; charset=utf-8", WEB_PAGE.toByteArray(Charsets.UTF_8))
+                return
+            }
+            if (params["pin"] != pin) {
+                writeHttp(out, 403, "text/plain", "PIN".toByteArray())
+                return
+            }
+            when (path) {
+                "/state" -> writeHttp(out, 200, "application/json; charset=utf-8", stateJson().toByteArray(Charsets.UTF_8))
+                "/cmd" -> {
+                    handleCmd(params)
+                    writeHttp(out, 200, "text/plain", "ok".toByteArray())
+                }
+                "/loupe" -> {
+                    val rx = (params["x"]?.toFloatOrNull() ?: 0.5f).coerceIn(0f, 1f)
+                    val ry = (params["y"]?.toFloatOrNull() ?: 0.5f).coerceIn(0f, 1f)
+                    val bmp = grabLoupe(rx, ry)
+                    if (bmp == null) {
+                        writeHttp(out, 500, "text/plain", "no frame".toByteArray())
+                    } else {
+                        val bos = ByteArrayOutputStream()
+                        bmp.compress(Bitmap.CompressFormat.JPEG, 92, bos)
+                        bmp.recycle()
+                        writeHttp(out, 200, "image/jpeg", bos.toByteArray())
+                    }
+                }
+                "/stream" -> streamTo(sock, out)
+                else -> writeHttp(out, 404, "text/plain", "404".toByteArray())
+            }
+        } catch (_: Exception) {
+        } finally {
+            try { sock.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun streamTo(sock: Socket, out: OutputStream) {
+        clients.incrementAndGet()
+        try {
+            out.write(
+                ("HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n" +
+                    "Cache-Control: no-store\r\nConnection: close\r\n\r\n").toByteArray()
+            )
+            var seen = -1L
+            while (serverOn && !sock.isClosed) {
+                val j = latestJpeg
+                if (j != null && frameSeq != seen) {
+                    seen = frameSeq
+                    out.write(("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + j.size + "\r\n\r\n").toByteArray())
+                    out.write(j)
+                    out.write("\r\n".toByteArray())
+                    out.flush()
+                } else {
+                    Thread.sleep(15)
+                }
+            }
+        } finally {
+            clients.decrementAndGet()
+        }
+    }
+
+    private fun producerLoop() {
+        while (serverOn) {
+            try {
+                if (clients.get() > 0) {
+                    val t0 = System.currentTimeMillis()
+                    val bmp = grabStream()
+                    if (bmp != null) {
+                        val bos = ByteArrayOutputStream(200_000)
+                        bmp.compress(Bitmap.CompressFormat.JPEG, 80, bos)
+                        bmp.recycle()
+                        latestJpeg = bos.toByteArray()
+                        frameSeq++
+                    }
+                    val dt = System.currentTimeMillis() - t0
+                    if (dt < 80) Thread.sleep(80 - dt)
+                } else {
+                    Thread.sleep(100)
+                }
+            } catch (_: Throwable) {
+                try { Thread.sleep(200) } catch (_: Throwable) {}
+            }
+        }
+    }
+
+    private fun grabStream(): Bitmap? {
+        val latch = CountDownLatch(1)
+        var res: Bitmap? = null
+        runOnUiThread {
+            try {
+                res = uiCaptureStream()
+            } catch (_: Throwable) {
+            } finally {
+                latch.countDown()
+            }
+        }
+        latch.await(800, TimeUnit.MILLISECONDS)
+        return res
+    }
+
+    private fun grabLoupe(rx: Float, ry: Float): Bitmap? {
+        val latch = CountDownLatch(1)
+        var res: Bitmap? = null
+        runOnUiThread {
+            try {
+                res = uiCaptureLoupe(rx, ry)
+            } catch (_: Throwable) {
+            } finally {
+                latch.countDown()
+            }
+        }
+        latch.await(3000, TimeUnit.MILLISECONDS)
+        return res
+    }
+
+    // размер изображения внутри вида (без чёрных полей) в пикселях вида
+    private fun imageRectSize(): FloatArray? {
+        val vw = texture.width
+        val vh = texture.height
+        if (vw == 0 || vh == 0) return null
+        val ca = previewSize.width.toFloat() / previewSize.height
+        val va = vw.toFloat() / vh
+        return if (va > ca) floatArrayOf(vh * ca, vh.toFloat()) else floatArrayOf(vw.toFloat(), vw / ca)
+    }
+
+    private fun uiCaptureStream(): Bitmap? {
+        if (!texture.isAvailable) return null
+        val img = imageRectSize() ?: return null
+        val vw = texture.width
+        val vh = texture.height
+        val k = 900f / img[1]
+        val bw = max(2, (vw * k).toInt())
+        val bh = max(2, (vh * k).toInt())
+        var sb = streamBmp
+        if (sb == null || sb.width != bw || sb.height != bh) {
+            sb = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
+            streamBmp = sb
+        }
+        texture.getBitmap(sb)
+        val iw = (img[0] * k).toInt()
+        val ih = (img[1] * k).toInt()
+        val x = max(0, (bw - iw) / 2)
+        val y = max(0, (bh - ih) / 2)
+        val w = min(iw, bw - x)
+        val h = min(ih, bh - y)
+        return Bitmap.createBitmap(sb, x, y, w, h)
+    }
+
+    private fun uiCaptureLoupe(rx: Float, ry: Float): Bitmap? {
+        if (!texture.isAvailable) return null
+        val img = imageRectSize() ?: return null
+        val vw = texture.width
+        val vh = texture.height
+        val k = previewSize.width / img[0]
+        val bw = (vw * k).toInt()
+        val bh = (vh * k).toInt()
+        if (bw < 2 || bh < 2 || bw.toLong() * bh > 45_000_000L) return null
+        val full: Bitmap = (try { texture.getBitmap(bw, bh) } catch (e: OutOfMemoryError) { null }) ?: return null
+        val iw = (img[0] * k).toInt()
+        val ih = (img[1] * k).toInt()
+        val x0 = max(0, (bw - iw) / 2)
+        val y0 = max(0, (bh - ih) / 2)
+        val cw = min(800, iw)
+        val ch = min(600, ih)
+        val cx = (x0 + rx * iw - cw / 2f).toInt().coerceIn(x0, max(x0, x0 + iw - cw))
+        val cy = (y0 + ry * ih - ch / 2f).toInt().coerceIn(y0, max(y0, y0 + ih - ch))
+        val w = min(cw, bw - cx)
+        val h = min(ch, bh - cy)
+        val out = Bitmap.createBitmap(full, cx, cy, w, h)
+        full.recycle()
+        return out
+    }
+
+    private fun stateJson(): String {
+        val sb = StringBuilder("{")
+        fun s(k: String, v: String) { sb.append("\"").append(k).append("\":\"").append(esc(v)).append("\",") }
+        fun n(k: String, v: Int) { sb.append("\"").append(k).append("\":").append(v).append(",") }
+        fun b(k: String, v: Boolean) { sb.append("\"").append(k).append("\":").append(if (v) "true" else "false").append(",") }
+        n("mode", mode)
+        b("rec", recording)
+        s("modeBtn", btnMode.text.toString())
+        s("recBtn", btnRec.text.toString())
+        s("pauseBtn", btnPause.text.toString())
+        s("stackBtn", btnStack.text.toString())
+        n("zoom", sbZoom.progress)
+        n("iso", sbIso.progress)
+        n("exp", sbExp.progress)
+        n("focus", sbFocus.progress)
+        n("boost", sbBoost.progress)
+        n("stack", sbStack.progress)
+        s("zoomLabel", tvZoom.text.toString())
+        s("isoLabel", tvIso.text.toString())
+        s("expLabel", tvExp.text.toString())
+        s("focusLabel", tvFocus.text.toString())
+        s("stackLabel", tvStack.text.toString())
+        s("boostLabel", tvBoost.text.toString())
+        b("boostOn", tvBoost.visibility == View.VISIBLE)
+        b("manExp", cbExp.isChecked)
+        b("manFocus", cbFocus.isChecked)
+        b("flip", cbFlip.isChecked)
+        b("stackSum", cbStackSum.isChecked)
+        s("aspect", btnAspect.text.toString())
+        s("nr", btnNr.text.toString())
+        s("edge", btnEdge.text.toString())
+        s("bitrate", btnBitrate.text.toString())
+        s("torch", btnTorch.text.toString())
+        sb.append("\"log\":\"").append(esc(recentLog())).append("\"}")
+        return sb.toString()
+    }
+
+    private fun handleCmd(p: Map<String, String>) {
+        val c = p["c"] ?: return
+        val n = p["n"] ?: ""
+        val v = p["v"] ?: ""
+        runOnUiThread { applyCmd(c, n, v) }
+    }
+
+    private fun applyCmd(c: String, n: String, v: String) {
+        try {
+                when (c) {
+                    "click" -> {
+                        when (n) {
+                            "mode" -> btnMode.performClick()
+                            "photo" -> btnPhoto.performClick()
+                            "rec" -> btnRec.performClick()
+                            "pause" -> btnPause.performClick()
+                            "stack" -> btnStack.performClick()
+                            "aspect" -> btnAspect.performClick()
+                            "nr" -> btnNr.performClick()
+                            "edge" -> btnEdge.performClick()
+                            "bitrate" -> btnBitrate.performClick()
+                            "torch" -> btnTorch.performClick()
+                            else -> {}
+                        }
+                    }
+                    "set" -> {
+                        val value = (v.toIntOrNull() ?: 0).coerceIn(0, 1000)
+                        when (n) {
+                            "zoom" -> sbZoom.progress = value
+                            "iso" -> sbIso.progress = value
+                            "exp" -> sbExp.progress = value
+                            "focus" -> sbFocus.progress = value
+                            "boost" -> sbBoost.progress = value
+                            "stack" -> sbStack.progress = value
+                            else -> {}
+                        }
+                        updateLabels()
+                        savePrefs()
+                        updateRepeating()
+                    }
+                    "check" -> {
+                        val on = v == "1"
+                        when (n) {
+                            "manExp" -> cbExp.isChecked = on
+                            "manFocus" -> cbFocus.isChecked = on
+                            "flip" -> cbFlip.isChecked = on
+                            "stackSum" -> cbStackSum.isChecked = on
+                            else -> {}
+                        }
+                    }
+                    else -> {}
+                }
+        } catch (e: Exception) {
+            log("Команда с планшета: $e")
+        }
     }
 
     // ---------- галерея, фонарик, экономия ----------
@@ -1888,9 +2298,169 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        stopServer()
         try { torchCb?.let { cm.unregisterTorchCallback(it) } } catch (_: Exception) {}
         closeAll()
         thread.quitSafely()
         super.onDestroy()
     }
 }
+
+private const val WEB_PAGE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MacroCam</title>
+<style>
+html,body{margin:0;height:100%;background:#000;color:#fff;font-family:sans-serif}
+#wrap{display:flex;height:100%}
+#left{flex:1;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center}
+#v{max-width:100%;max-height:100%;display:block}
+#pk{position:absolute;pointer-events:none}
+#loupe{display:none;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);border:2px solid #0f0}
+#right{width:360px;overflow-y:auto;background:#161616;padding:8px;box-sizing:border-box}
+button{margin:3px 0;padding:12px;font-size:16px;width:100%}
+.row{display:flex;gap:6px}
+.row button{flex:1}
+input[type=range]{width:100%;height:34px}
+label{display:block;margin:8px 0 2px}
+#log{font-size:11px;color:#9a9;white-space:pre-wrap;margin-top:8px}
+</style></head><body>
+<div id="wrap">
+<div id="left"><img id="v" alt=""><canvas id="pk"></canvas><img id="loupe" alt=""></div>
+<div id="right">
+<div class="row"><button id="bMode">Режим</button></div>
+<div class="row"><button id="bPhoto">Фото</button><button id="bStack">Долгая</button></div>
+<div class="row"><button id="bRec">Запись</button><button id="bPause">Пауза</button></div>
+<label><input type="checkbox" id="cPk"> Подсветка краёв (на планшете)</label>
+<input type="range" id="sPk" min="10" max="150" value="45">
+<div style="font-size:12px;color:#999">Нажмите на картинку: лупа 1:1 (нажмите на лупу, чтобы закрыть)</div>
+<label id="lZoom">Зум</label><input type="range" id="sZoom" min="0" max="1000">
+<label><input type="checkbox" id="cExp"> Ручные ISO и выдержка</label>
+<label id="lIso">ISO</label><input type="range" id="sIso" min="0" max="1000">
+<label id="lExp">Выдержка</label><input type="range" id="sExp" min="0" max="1000">
+<div id="boostBox" style="display:none"><label id="lBoost">Усиление</label><input type="range" id="sBoost" min="0" max="1000"></div>
+<label><input type="checkbox" id="cFocus"> Ручной фокус</label>
+<label id="lFocus">Фокус</label><input type="range" id="sFocus" min="0" max="1000">
+<label id="lStack">Долгая выдержка</label><input type="range" id="sStack" min="0" max="118">
+<label><input type="checkbox" id="cSum"> Суммировать (ярче)</label>
+<label><input type="checkbox" id="cFlip"> Перевернуть 180°</label>
+<button id="bAspect">Формат</button>
+<button id="bNr">Шумоподавление</button>
+<button id="bEdge">Контуры</button>
+<button id="bBit">Битрейт</button>
+<button id="bTorch">Фонарик</button>
+<div id="log"></div>
+</div></div>
+<script>
+var pin = localStorage.getItem('pin') || '';
+var G = function(i){ return document.getElementById(i); };
+var st = null, active = null, pend = {}, timer = null, gaveUp = false;
+function q(p){ return p + (p.indexOf('?') < 0 ? '?' : '&') + 'pin=' + encodeURIComponent(pin); }
+function ask(){
+  if (gaveUp) return;
+  var p = prompt('PIN с экрана телефона');
+  if (p === null) { gaveUp = true; return; }
+  pin = p; localStorage.setItem('pin', p); startStream();
+}
+function startStream(){ G('v').src = q('/stream?t=' + Date.now()); }
+G('v').onerror = function(){ if (!gaveUp) setTimeout(startStream, 1000); };
+function cmd(c, n, v){ fetch(q('/cmd?c=' + c + '&n=' + n + '&v=' + encodeURIComponent(v))).then(poll).catch(function(){}); }
+function flush(){ timer = null; for (var k in pend){ cmd('set', k, pend[k]); } pend = {}; }
+function slider(id, name){
+  var s = G(id);
+  s.addEventListener('input', function(){ active = id; pend[name] = s.value; if (!timer) timer = setTimeout(flush, 80); });
+  s.addEventListener('change', function(){ active = null; });
+}
+function check(id, name){ G(id).addEventListener('change', function(){ cmd('check', name, G(id).checked ? 1 : 0); }); }
+function bindClick(id, name){ G(id).addEventListener('click', function(){ cmd('click', name, ''); }); }
+function setSl(id, val){ if (active !== id) G(id).value = val; }
+function poll(){
+  if (gaveUp) return;
+  fetch(q('/state')).then(function(r){
+    if (r.status === 403) { ask(); return null; }
+    return r.json();
+  }).then(function(s){
+    if (!s) return;
+    st = s;
+    G('bMode').textContent = s.modeBtn;
+    G('bPhoto').style.display = s.mode === 0 ? '' : 'none';
+    G('bStack').style.display = s.mode === 0 ? '' : 'none';
+    G('bRec').style.display = s.mode === 1 ? '' : 'none';
+    G('bPause').style.display = (s.mode === 1 && s.rec) ? '' : 'none';
+    G('bRec').textContent = s.recBtn;
+    G('bPause').textContent = s.pauseBtn;
+    G('bStack').textContent = s.stackBtn;
+    G('lZoom').textContent = s.zoomLabel;
+    G('lIso').textContent = s.isoLabel;
+    G('lExp').textContent = s.expLabel;
+    G('lFocus').textContent = s.focusLabel;
+    G('lStack').textContent = s.stackLabel;
+    G('lBoost').textContent = s.boostLabel;
+    G('boostBox').style.display = s.boostOn ? '' : 'none';
+    setSl('sZoom', s.zoom); setSl('sIso', s.iso); setSl('sExp', s.exp);
+    setSl('sFocus', s.focus); setSl('sBoost', s.boost); setSl('sStack', s.stack);
+    G('cExp').checked = s.manExp; G('cFocus').checked = s.manFocus;
+    G('cFlip').checked = s.flip; G('cSum').checked = s.stackSum;
+    G('bAspect').textContent = s.aspect;
+    G('bNr').textContent = s.nr;
+    G('bEdge').textContent = s.edge;
+    G('bBit').textContent = s.bitrate;
+    G('bTorch').textContent = s.torch;
+    G('v').style.transform = s.flip ? 'rotate(180deg)' : '';
+    G('loupe').style.transform = s.flip ? 'translate(-50%,-50%) rotate(180deg)' : 'translate(-50%,-50%)';
+    G('log').textContent = s.log;
+  }).catch(function(){});
+}
+slider('sZoom', 'zoom'); slider('sIso', 'iso'); slider('sExp', 'exp');
+slider('sFocus', 'focus'); slider('sBoost', 'boost'); slider('sStack', 'stack');
+check('cExp', 'manExp'); check('cFocus', 'manFocus'); check('cFlip', 'flip'); check('cSum', 'stackSum');
+bindClick('bMode', 'mode'); bindClick('bPhoto', 'photo'); bindClick('bStack', 'stack');
+bindClick('bRec', 'rec'); bindClick('bPause', 'pause'); bindClick('bAspect', 'aspect');
+bindClick('bNr', 'nr'); bindClick('bEdge', 'edge'); bindClick('bBit', 'bitrate'); bindClick('bTorch', 'torch');
+
+G('v').addEventListener('click', function(e){
+  var r = G('v').getBoundingClientRect();
+  var x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
+  if (st && st.flip) { x = 1 - x; y = 1 - y; }
+  var L = G('loupe'); L.style.display = 'block';
+  L.src = q('/loupe?x=' + x + '&y=' + y + '&t=' + Date.now());
+});
+G('loupe').onload = function(){
+  var L = G('loupe');
+  L.style.width = (L.naturalWidth / window.devicePixelRatio) + 'px';
+};
+G('loupe').addEventListener('click', function(){ G('loupe').style.display = 'none'; });
+
+var cv = document.createElement('canvas'), cx = cv.getContext('2d');
+var pk = G('pk'), px = pk.getContext('2d');
+function peak(){
+  var v = G('v');
+  if (G('cPk').checked && v.naturalWidth > 0) {
+    var w = 480, h = Math.round(480 * v.naturalHeight / v.naturalWidth);
+    cv.width = w; cv.height = h;
+    try {
+      cx.drawImage(v, 0, 0, w, h);
+      var d = cx.getImageData(0, 0, w, h).data;
+      pk.width = w; pk.height = h;
+      var o = px.createImageData(w, h), od = o.data, th = +G('sPk').value;
+      for (var y = 1; y < h - 1; y++) {
+        for (var x = 1; x < w - 1; x++) {
+          var i = (y * w + x) * 4;
+          var gx = d[i + 5] - d[i - 3], gy = d[i + w * 4 + 1] - d[i - w * 4 + 1];
+          if (Math.abs(gx) + Math.abs(gy) > th) { od[i] = 255; od[i + 3] = 255; }
+        }
+      }
+      px.putImageData(o, 0, 0);
+      pk.style.left = v.offsetLeft + 'px'; pk.style.top = v.offsetTop + 'px';
+      pk.style.width = v.clientWidth + 'px'; pk.style.height = v.clientHeight + 'px';
+      pk.style.transform = (st && st.flip) ? 'rotate(180deg)' : '';
+    } catch (e) {}
+  } else {
+    px.clearRect(0, 0, pk.width, pk.height);
+  }
+  setTimeout(peak, 150);
+}
+if (!pin) ask(); else startStream();
+poll(); setInterval(poll, 600); peak();
+</script></body></html>
+"""
