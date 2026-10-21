@@ -1351,48 +1351,43 @@ class MainActivity : Activity() {
 
     private fun uiCaptureStream(): Bitmap? {
         if (!texture.isAvailable) return null
-        val img = imageRectSize() ?: return null
-        val vw = texture.width
-        val vh = texture.height
-        val k = 900f / img[1]
-        val bw = max(2, (vw * k).toInt())
-        val bh = max(2, (vh * k).toInt())
+        val pw = previewSize.width
+        val ph = previewSize.height
+        val srcW = 900
+        val srcH = max(2, srcW * pw / ph)
         var sb = streamBmp
-        if (sb == null || sb.width != bw || sb.height != bh) {
-            sb = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
+        if (sb == null || sb.width != srcW || sb.height != srcH) {
+            sb = Bitmap.createBitmap(srcW, srcH, Bitmap.Config.ARGB_8888)
             streamBmp = sb
         }
         texture.getBitmap(sb)
-        val iw = (img[0] * k).toInt()
-        val ih = (img[1] * k).toInt()
-        val x = max(0, (bw - iw) / 2)
-        val y = max(0, (bh - ih) / 2)
-        val w = min(iw, bw - x)
-        val h = min(ih, bh - y)
-        return Bitmap.createBitmap(sb, x, y, w, h)
+        val m = Matrix()
+        val rot = displayDegrees()
+        if (rot == 90) m.postRotate(-90f) else if (rot == 270) m.postRotate(90f)
+        return Bitmap.createBitmap(sb, 0, 0, srcW, srcH, m, false)
     }
 
     private fun uiCaptureLoupe(rx: Float, ry: Float): Bitmap? {
         if (!texture.isAvailable) return null
-        val img = imageRectSize() ?: return null
-        val vw = texture.width
-        val vh = texture.height
-        val k = previewSize.width / img[0]
-        val bw = (vw * k).toInt()
-        val bh = (vh * k).toInt()
-        if (bw < 2 || bh < 2 || bw.toLong() * bh > 45_000_000L) return null
-        val full: Bitmap = (try { texture.getBitmap(bw, bh) } catch (e: OutOfMemoryError) { null }) ?: return null
-        val iw = (img[0] * k).toInt()
-        val ih = (img[1] * k).toInt()
-        val x0 = max(0, (bw - iw) / 2)
-        val y0 = max(0, (bh - ih) / 2)
-        val cw = min(800, iw)
-        val ch = min(600, ih)
-        val cx = (x0 + rx * iw - cw / 2f).toInt().coerceIn(x0, max(x0, x0 + iw - cw))
-        val cy = (y0 + ry * ih - ch / 2f).toInt().coerceIn(y0, max(y0, y0 + ih - ch))
-        val w = min(cw, bw - cx)
-        val h = min(ch, bh - cy)
-        val out = Bitmap.createBitmap(full, cx, cy, w, h)
+        val lw = previewSize.width
+        val lh = previewSize.height
+        val wp = lh
+        val hp = lw
+        val full: Bitmap = (try { texture.getBitmap(wp, hp) } catch (e: OutOfMemoryError) { null }) ?: return null
+        val cw = min(800, lw)
+        val ch = min(600, lh)
+        val cx = (rx * lw - cw / 2f).toInt().coerceIn(0, lw - cw)
+        val cy = (ry * lh - ch / 2f).toInt().coerceIn(0, lh - ch)
+        val m = Matrix()
+        val crop: Bitmap
+        if (displayDegrees() == 270) {
+            crop = Bitmap.createBitmap(full, cy, hp - (cx + cw), ch, cw)
+            m.postRotate(90f)
+        } else {
+            crop = Bitmap.createBitmap(full, wp - (cy + ch), cx, ch, cw)
+            m.postRotate(-90f)
+        }
+        val out = Bitmap.createBitmap(crop, 0, 0, crop.width, crop.height, m, false)
         full.recycle()
         return out
     }
