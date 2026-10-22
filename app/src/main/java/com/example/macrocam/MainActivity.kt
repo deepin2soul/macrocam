@@ -124,6 +124,7 @@ class MainActivity : Activity() {
     @Volatile private var latestJpeg: ByteArray? = null
     @Volatile private var frameSeq = 0L
     private var streamBmp: Bitmap? = null
+    private var loupeBmp: Bitmap? = null
     private lateinit var btnPause: Button
     private lateinit var btnGallery: Button
     private lateinit var btnTorch: Button
@@ -733,7 +734,10 @@ class MainActivity : Activity() {
         return (r.lower + (r.upper - r.lower) * (sbBoost.progress / 1000.0)).toInt()
     }
 
-    private fun currentFocus(): Float = (1f - sbFocus.progress / 1000f) * minFocus
+    private fun currentFocus(): Float {
+        val f = 26f + (10f - 26f) * (sbFocus.progress / 1000f)
+        return if (minFocus > 0f) min(f, minFocus) else f
+    }
 
     private fun currentZoom(): Float =
         maxZoom.toDouble().pow(sbZoom.progress / 1000.0).toFloat()
@@ -1252,6 +1256,11 @@ class MainActivity : Activity() {
                     }
                 }
                 "/stream" -> streamTo(sock, out)
+                "/loupestream" -> {
+                    val lx = (params["x"]?.toFloatOrNull() ?: 0.5f).coerceIn(0f, 1f)
+                    val ly = (params["y"]?.toFloatOrNull() ?: 0.5f).coerceIn(0f, 1f)
+                    loupeStreamTo(sock, out, lx, ly)
+                }
                 else -> writeHttp(out, 404, "text/plain", "404".toByteArray())
             }
         } catch (_: Exception) {
@@ -1282,6 +1291,29 @@ class MainActivity : Activity() {
             }
         } finally {
             clients.decrementAndGet()
+        }
+    }
+
+    private fun loupeStreamTo(sock: Socket, out: OutputStream, rx: Float, ry: Float) {
+        out.write(
+            ("HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n" +
+                "Cache-Control: no-store\r\nConnection: close\r\n\r\n").toByteArray()
+        )
+        while (serverOn && !sock.isClosed) {
+            val t0 = System.currentTimeMillis()
+            val bmp = grabLoupe(rx, ry)
+            if (bmp != null) {
+                val bos = ByteArrayOutputStream(150_000)
+                bmp.compress(Bitmap.CompressFormat.JPEG, 88, bos)
+                bmp.recycle()
+                val j = bos.toByteArray()
+                out.write(("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + j.size + "\r\n\r\n").toByteArray())
+                out.write(j)
+                out.write("\r\n".toByteArray())
+                out.flush()
+            }
+            val dt = System.currentTimeMillis() - t0
+            if (dt < 120) Thread.sleep(120 - dt)
         }
     }
 
@@ -1373,7 +1405,13 @@ class MainActivity : Activity() {
         val lh = previewSize.height
         val wp = lh
         val hp = lw
-        val full: Bitmap = (try { texture.getBitmap(wp, hp) } catch (e: OutOfMemoryError) { null }) ?: return null
+        var full = loupeBmp
+        if (full == null || full.width != wp || full.height != hp) {
+            full = try { Bitmap.createBitmap(wp, hp, Bitmap.Config.ARGB_8888) } catch (e: OutOfMemoryError) { null }
+            loupeBmp = full
+        }
+        if (full == null) return null
+        texture.getBitmap(full)
         val cw = min(800, lw)
         val ch = min(600, lh)
         val cx = (rx * lw - cw / 2f).toInt().coerceIn(0, lw - cw)
@@ -1388,7 +1426,7 @@ class MainActivity : Activity() {
             m.postRotate(-90f)
         }
         val out = Bitmap.createBitmap(crop, 0, 0, crop.width, crop.height, m, false)
-        full.recycle()
+        crop.recycle()
         return out
     }
 
@@ -2311,6 +2349,7 @@ html,body{margin:0;height:100%;background:#000;color:#fff;font-family:sans-serif
 #left{flex:1;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center}
 #v{max-width:100%;max-height:100%;display:block}
 #pk{position:absolute;pointer-events:none}
+#tog{position:absolute;top:8px;right:8px;z-index:10;width:auto;margin:0;padding:8px 14px;opacity:.6}
 #loupe{display:none;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);border:2px solid #0f0}
 #right{width:360px;overflow-y:auto;background:#161616;padding:8px;box-sizing:border-box}
 button{margin:3px 0;padding:12px;font-size:16px;width:100%}
@@ -2321,14 +2360,14 @@ label{display:block;margin:8px 0 2px}
 #log{font-size:11px;color:#9a9;white-space:pre-wrap;margin-top:8px}
 </style></head><body>
 <div id="wrap">
-<div id="left"><img id="v" alt=""><canvas id="pk"></canvas><img id="loupe" alt=""></div>
+<div id="left"><img id="v" alt=""><canvas id="pk"></canvas><img id="loupe" alt=""><button id="tog">&#9776;</button></div>
 <div id="right">
 <div class="row"><button id="bMode">Режим</button></div>
 <div class="row"><button id="bPhoto">Фото</button><button id="bStack">Долгая</button></div>
 <div class="row"><button id="bRec">Запись</button><button id="bPause">Пауза</button></div>
 <label><input type="checkbox" id="cPk"> Подсветка краёв (на планшете)</label>
 <input type="range" id="sPk" min="10" max="150" value="45">
-<div style="font-size:12px;color:#999">Нажмите на картинку: лупа 1:1 (нажмите на лупу, чтобы закрыть)</div>
+<div style="font-size:12px;color:#999">Нажмите на картинку: живая лупа 1:1 (нажмите на лупу, чтобы закрыть; нажмите в другом месте, чтобы сдвинуть). Кнопка в правом верхнем углу скрывает меню.</div>
 <label id="lZoom">Зум</label><input type="range" id="sZoom" min="0" max="1000">
 <label><input type="checkbox" id="cExp"> Ручные ISO и выдержка</label>
 <label id="lIso">ISO</label><input type="range" id="sIso" min="0" max="1000">
@@ -2418,13 +2457,13 @@ G('v').addEventListener('click', function(e){
   var x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
   if (st && st.flip) { x = 1 - x; y = 1 - y; }
   var L = G('loupe'); L.style.display = 'block';
-  L.src = q('/loupe?x=' + x + '&y=' + y + '&t=' + Date.now());
+  L.src = q('/loupestream?x=' + x + '&y=' + y + '&t=' + Date.now());
 });
 G('loupe').onload = function(){
   var L = G('loupe');
   L.style.width = (L.naturalWidth / window.devicePixelRatio) + 'px';
 };
-G('loupe').addEventListener('click', function(){ G('loupe').style.display = 'none'; });
+G('loupe').addEventListener('click', function(){ G('loupe').style.display = 'none'; G('loupe').removeAttribute('src'); });
 
 var cv = document.createElement('canvas'), cx = cv.getContext('2d');
 var pk = G('pk'), px = pk.getContext('2d');
@@ -2455,6 +2494,12 @@ function peak(){
   }
   setTimeout(peak, 150);
 }
+function applyHide(){ G('right').style.display = (localStorage.getItem('hide') === '1') ? 'none' : ''; }
+G('tog').addEventListener('click', function(){
+  localStorage.setItem('hide', localStorage.getItem('hide') === '1' ? '0' : '1');
+  applyHide();
+});
+applyHide();
 if (!pin) ask(); else startStream();
 poll(); setInterval(poll, 600); peak();
 </script></body></html>
