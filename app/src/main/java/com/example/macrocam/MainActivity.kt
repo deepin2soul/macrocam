@@ -1,5 +1,5 @@
 package com.example.macrocam
-
+ 
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
