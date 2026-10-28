@@ -182,6 +182,7 @@ class MainActivity : Activity() {
     private var stackCount = 0
     private var stackTarget = 0
     private var stackSubmitted = 0
+    private var stackLogged = 0
     private var stackSum = true
     private var stackW = 0
     private var stackH = 0
@@ -1878,6 +1879,7 @@ class MainActivity : Activity() {
         stackFrameExpNs = exp
         stackCount = 0
         stackSubmitted = 0
+        stackLogged = 0
         stackCancel = false
         stackSum = true
         try {
@@ -1903,7 +1905,7 @@ class MainActivity : Activity() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     session = s
                     log("Долгая выдержка: $n кадров, режим " + (if (stackSum) "сумма" else "среднее"))
-                    startFocusRamp { startStackRepeating() }
+                    startFocusRamp { beginStackCaptures() }
                 }
                 override fun onConfigureFailed(s: CameraCaptureSession) {
                     log("Сессия не настроилась")
@@ -1920,23 +1922,47 @@ class MainActivity : Activity() {
         }
     }
 
-    // Один повторяющийся запрос: камера снимает кадры подряд, без пауз между ними
-    private fun startStackRepeating() {
+    // Результат кадра: проверяем, какую выдержку реально дала камера
+    private val stackCb = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult
+        ) {
+            val e = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+            if (e != null && stackFrameExpNs > 0 && stackLogged < 3) {
+                val ratio = e.toDouble() / stackFrameExpNs
+                if (stackLogged == 0 || ratio < 0.9 || ratio > 1.1) {
+                    stackLogged++
+                    log("Выдержка кадра по данным камеры: " + fmtExp(e) + " (задано " + fmtExp(stackFrameExpNs) + ")")
+                }
+            }
+        }
+    }
+
+    // Превью-запрос останавливаем: иначе его кадры (с той же выдержкой) вклиниваются между снимками
+    // и удваивают время. Снимки ставим в очередь по несколько штук, чтобы датчик не простаивал.
+    private fun beginStackCaptures() {
+        try { session?.stopRepeating() } catch (_: Exception) {}
+        val first = min(3, stackTarget)
+        for (i in 0 until first) captureStackFrame()
+    }
+
+    private fun captureStackFrame() {
         val cam = device
-        val sess = session
+        val s = session
         val reader = stackReader
         val ps = stackSurface
-        if (cam == null || sess == null || reader == null || ps == null) return
+        if (cam == null || s == null || reader == null || ps == null) return
         try {
-            val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             b.addTarget(reader.surface)
             b.addTarget(ps)
             applyControls(b, false)
-            builder = b
-            sess.setRepeatingRequest(b.build(), null, handler)
-            log("Серия кадров запущена")
+            s.capture(b.build(), stackCb, handler)
+            stackSubmitted++
         } catch (e: Exception) {
-            log("Ошибка серии: $e")
+            log("Ошибка кадра: $e")
             finishStack()
         }
     }
@@ -1955,10 +1981,8 @@ class MainActivity : Activity() {
         val cnt = stackCount
         val tgt = stackTarget
         runOnUiThread { btnStack.text = "Стоп $cnt/$tgt" }
-        if (stackCancel || cnt >= tgt) {
-            try { session?.stopRepeating() } catch (_: Exception) {}
-            finishStack()
-        }
+        if (stackCancel || cnt >= tgt) finishStack()
+        else if (stackSubmitted < tgt) captureStackFrame()
     }
 
     private fun accumulate(img: Image) {
