@@ -246,21 +246,20 @@ class MainActivity : Activity() {
 
         // левая колонка, всегда на экране
         btnPanel = mkBtn("Панель")
-        btnMode = mkBtn("Режим: Фото")
+        btnMode = mkBtn("Режим")
         btnPhoto = mkBtn("Фото")
-        btnStack = mkBtn("Долгая")
-        btnRec = mkBtn("Запись")
+        btnStack = mkBtn("Выдержка")
+        btnRec = mkBtn("Видео")
         btnPause = mkBtn("Пауза")
         btnPause.visibility = View.GONE
         btnGallery = mkBtn("Галерея")
         val left = LinearLayout(this)
         left.orientation = LinearLayout.VERTICAL
-        left.addView(btnPanel)
-        left.addView(btnMode)
-        left.addView(btnPhoto)
-        left.addView(btnStack)
         left.addView(btnRec)
         left.addView(btnPause)
+        left.addView(btnPhoto)
+        left.addView(btnStack)
+        left.addView(btnPanel)
         left.addView(btnGallery)
         val leftLp = FrameLayout.LayoutParams(wrap, wrap, Gravity.START or Gravity.CENTER_VERTICAL)
         leftLp.leftMargin = dp(8)
@@ -1075,17 +1074,15 @@ class MainActivity : Activity() {
     }
 
     private fun updateModeUi() {
-        btnMode.text = if (mode == 0) "Режим: Фото" else "Режим: Видео"
-        val photo = mode == 0
-        btnPhoto.visibility = if (photo) View.VISIBLE else View.GONE
-        btnStack.visibility = if (photo) View.VISIBLE else View.GONE
-        btnRec.visibility = if (photo) View.GONE else View.VISIBLE
+        btnPhoto.visibility = View.VISIBLE
+        btnStack.visibility = View.VISIBLE
+        btnRec.visibility = View.VISIBLE
         updatePauseUi()
     }
 
     private fun updatePauseUi() {
         runOnUiThread {
-            btnPause.visibility = if (mode == 1 && recording) View.VISIBLE else View.GONE
+            btnPause.visibility = if (recording) View.VISIBLE else View.GONE
             btnPause.text = if (paused) "Продолжить" else "Пауза"
         }
     }
@@ -1699,7 +1696,7 @@ class MainActivity : Activity() {
                     sessionHasRecorder = hasRec
                     try {
                         s.setRepeatingRequest(b.build(), null, handler)
-                        log("Режим " + (if (mode == 0) "«Фото»" else "«Видео»") + ": превью запущено")
+                        log("Камера: превью запущено")
                     } catch (e: Exception) {
                         log("Ошибка запроса: $e")
                     }
@@ -1748,7 +1745,6 @@ class MainActivity : Activity() {
         if (device == null || session == null) { log("Сначала откройте камеру"); return }
         if (recording) { log("Во время записи фото недоступно"); return }
         if (stacking) { log("Идёт долгая выдержка"); return }
-        if (mode != 0) { log("Переключите режим на «Фото»"); return }
         if (rampActive) { log("Подождите, линза встаёт на место"); return }
         val info = shotInfo()
         val tag = fileTag()
@@ -1842,7 +1838,7 @@ class MainActivity : Activity() {
         yAcc = null
         uAcc = null
         vAcc = null
-        runOnUiThread { btnStack.text = "Долгая" }
+        runOnUiThread { btnStack.text = "Выдержка" }
     }
 
     private fun startStack() {
@@ -1854,7 +1850,6 @@ class MainActivity : Activity() {
         val cam = device
         if (cam == null) { log("Сначала откройте камеру"); return }
         if (recording) { log("Остановите запись"); return }
-        if (mode != 0) { log("Переключите режим на «Фото»"); return }
         if (rampActive) { log("Подождите, линза встаёт на место"); return }
         if (!cbExp.isChecked || isoRange == null || expRange == null) {
             log("Включите «Ручные ISO и выдержка» и задайте выдержку одного кадра")
@@ -2073,7 +2068,6 @@ class MainActivity : Activity() {
     private fun startRecording() {
         if (stacking) { log("Идёт долгая выдержка"); return }
         if (device == null) { log("Камера ещё не открыта"); return }
-        if (mode != 1) { log("Переключите режим на «Видео»"); return }
         if (rampActive) { log("Подождите, линза встаёт на место"); return }
         if (sessionHasRecorder && persistentSurface != null) startRecordingPersistent()
         else startRecordingLegacy()
@@ -2151,7 +2145,7 @@ class MainActivity : Activity() {
             cleanupRecorder()
             recording = false
             recordingPersistent = false
-            btnRec.text = "Запись"
+            btnRec.text = "Видео"
             updatePauseUi()
             restorePreview()
         }
@@ -2164,7 +2158,7 @@ class MainActivity : Activity() {
         finishVideoFile()
         recording = false
         recordingPersistent = false
-        btnRec.text = "Запись"
+        btnRec.text = "Видео"
         updatePauseUi()
         log("Видео сохранено: Movies/MacroCam")
     }
@@ -2275,7 +2269,7 @@ class MainActivity : Activity() {
         cleanupRecorder()
         finishVideoFile()
         recording = false
-        btnRec.text = "Запись"
+        btnRec.text = "Видео"
         updatePauseUi()
         log("Видео сохранено: Movies/MacroCam")
         startPreview()
@@ -2363,9 +2357,8 @@ label{display:block;margin:8px 0 2px}
 <div id="wrap">
 <div id="left"><img id="v" alt=""><canvas id="pk"></canvas><img id="loupe" alt=""><button id="tog">&#9776;</button></div>
 <div id="right">
-<div class="row"><button id="bMode">Режим</button></div>
-<div class="row"><button id="bPhoto">Фото</button><button id="bStack">Долгая</button></div>
-<div class="row"><button id="bRec">Запись</button><button id="bPause">Пауза</button></div>
+<div class="row"><button id="bPhoto">Фото</button><button id="bStack">Выдержка</button></div>
+<div class="row"><button id="bRec">Видео</button><button id="bPause">Пауза</button></div>
 <label><input type="checkbox" id="cPk"> Подсветка краёв (на планшете)</label>
 <input type="range" id="sPk" min="10" max="150" value="45">
 <div style="font-size:12px;color:#999">Нажмите на картинку: живая лупа 1:1 (нажмите на лупу, чтобы закрыть; нажмите в другом месте, чтобы сдвинуть). Кнопка в правом верхнем углу скрывает меню.</div>
@@ -2417,11 +2410,7 @@ function poll(){
   }).then(function(s){
     if (!s) return;
     st = s;
-    G('bMode').textContent = s.modeBtn;
-    G('bPhoto').style.display = s.mode === 0 ? '' : 'none';
-    G('bStack').style.display = s.mode === 0 ? '' : 'none';
-    G('bRec').style.display = s.mode === 1 ? '' : 'none';
-    G('bPause').style.display = (s.mode === 1 && s.rec) ? '' : 'none';
+    G('bPause').style.display = s.rec ? '' : 'none';
     G('bRec').textContent = s.recBtn;
     G('bPause').textContent = s.pauseBtn;
     G('bStack').textContent = s.stackBtn;
@@ -2449,7 +2438,7 @@ function poll(){
 slider('sZoom', 'zoom'); slider('sIso', 'iso'); slider('sExp', 'exp');
 slider('sFocus', 'focus'); slider('sBoost', 'boost'); slider('sStack', 'stack');
 check('cExp', 'manExp'); check('cFocus', 'manFocus'); check('cFlip', 'flip'); check('cSum', 'stackSum');
-bindClick('bMode', 'mode'); bindClick('bPhoto', 'photo'); bindClick('bStack', 'stack');
+bindClick('bPhoto', 'photo'); bindClick('bStack', 'stack');
 bindClick('bRec', 'rec'); bindClick('bPause', 'pause'); bindClick('bAspect', 'aspect');
 bindClick('bNr', 'nr'); bindClick('bEdge', 'edge'); bindClick('bBit', 'bitrate'); bindClick('bTorch', 'torch');
 
