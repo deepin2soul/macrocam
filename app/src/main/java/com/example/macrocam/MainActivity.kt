@@ -183,6 +183,7 @@ class MainActivity : Activity() {
     private var stackTarget = 0
     private var stackSubmitted = 0
     private var stackLogged = 0
+    private var stackLastT = 0L
     private var stackSum = true
     private var stackW = 0
     private var stackH = 0
@@ -1940,10 +1941,12 @@ class MainActivity : Activity() {
         }
     }
 
-    // Превью-запрос останавливаем: иначе его кадры (с той же выдержкой) вклиниваются между снимками
-    // и удваивают время. Снимки ставим в очередь по несколько штук, чтобы датчик не простаивал.
+    // Превью замирает на последнем кадре: запрос превью останавливаем и больше не отправляем кадры на экран.
+    // Камера занимается только серией снимков, которые ставятся в очередь по несколько штук.
     private fun beginStackCaptures() {
         try { session?.stopRepeating() } catch (_: Exception) {}
+        stackLastT = System.currentTimeMillis()
+        log("Превью заморожено, идёт серия кадров")
         val first = min(3, stackTarget)
         for (i in 0 until first) captureStackFrame()
     }
@@ -1952,13 +1955,12 @@ class MainActivity : Activity() {
         val cam = device
         val s = session
         val reader = stackReader
-        val ps = stackSurface
-        if (cam == null || s == null || reader == null || ps == null) return
+        if (cam == null || s == null || reader == null) return
         try {
             val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             b.addTarget(reader.surface)
-            b.addTarget(ps)
             applyControls(b, false)
+            if (Build.VERSION.SDK_INT >= 30) b.set(CaptureRequest.CONTROL_ENABLE_ZSL, false)
             s.capture(b.build(), stackCb, handler)
             stackSubmitted++
         } catch (e: Exception) {
@@ -1980,6 +1982,11 @@ class MainActivity : Activity() {
         stackCount++
         val cnt = stackCount
         val tgt = stackTarget
+        val now = System.currentTimeMillis()
+        if (cnt <= 5) {
+            log("Кадр " + cnt + "/" + tgt + ": +" + String.format(Locale.US, "%.2f", (now - stackLastT) / 1000.0) + " с")
+        }
+        stackLastT = now
         runOnUiThread { btnStack.text = "Стоп $cnt/$tgt" }
         if (stackCancel || cnt >= tgt) finishStack()
         else if (stackSubmitted < tgt) captureStackFrame()
