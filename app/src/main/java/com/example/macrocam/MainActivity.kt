@@ -181,6 +181,7 @@ class MainActivity : Activity() {
     private var stackSurface: Surface? = null
     private var stackCount = 0
     private var stackTarget = 0
+    private var stackSubmitted = 0
     private var stackSum = true
     private var stackW = 0
     private var stackH = 0
@@ -313,7 +314,6 @@ class MainActivity : Activity() {
         col.addView(sbBoost)
         col.addView(tvStack)
         col.addView(sbStack)
-        col.addView(cbStackSum)
         col.addView(btnNr)
         col.addView(btnEdge)
         col.addView(btnBitrate)
@@ -377,7 +377,7 @@ class MainActivity : Activity() {
         sbExp.progress = prefs.getInt("exp", 500)
         sbFocus.progress = prefs.getInt("focus", 200)
         sbStack.progress = prefs.getInt("stack", 28)
-        cbStackSum.isChecked = prefs.getBoolean("stackSum", true)
+        cbStackSum.isChecked = true
         sbBoost.progress = prefs.getInt("boost", 0)
         mode = prefs.getInt("mode", 0).coerceIn(0, 1)
         updateModeUi()
@@ -951,12 +951,15 @@ class MainActivity : Activity() {
 
     private fun displayDegrees(): Int {
         val rotation = windowManager.defaultDisplay.rotation
-        return when (rotation) {
+        val deg = when (rotation) {
             Surface.ROTATION_90 -> 90
             Surface.ROTATION_180 -> 180
             Surface.ROTATION_270 -> 270
             else -> 0
         }
+        // приложение всегда альбомное: после возврата из галереи система может ещё сообщать портрет
+        if (texture.width > texture.height && (deg == 0 || deg == 180)) return 90
+        return deg
     }
 
     // Поворот для файлов (видео и фото) с учётом ориентации экрана и переворота 180°
@@ -976,8 +979,8 @@ class MainActivity : Activity() {
                 val cx = vw / 2f
                 val cy = vh / 2f
                 val m = Matrix()
-                val rot = windowManager.defaultDisplay.rotation
-                if (rot == Surface.ROTATION_90 || rot == Surface.ROTATION_270) {
+                val deg = displayDegrees()
+                if (deg == 90 || deg == 270) {
                     // TextureView показывает кадр как в портрете: снимаем растяжение,
                     // вписываем в экран и поворачиваем в альбомную ориентацию
                     val viewRect = RectF(0f, 0f, vw, vh)
@@ -986,8 +989,8 @@ class MainActivity : Activity() {
                     m.setRectToRect(viewRect, bufRect, Matrix.ScaleToFit.FILL)
                     val scale = min(vh / ph, vw / pw)
                     m.postScale(scale, scale, cx, cy)
-                    m.postRotate(90f * (rot - 2), cx, cy)
-                } else if (rot == Surface.ROTATION_180) {
+                    m.postRotate(if (deg == 90) -90f else 90f, cx, cy)
+                } else if (deg == 180) {
                     m.postRotate(180f, cx, cy)
                 }
                 texture.setTransform(m)
@@ -1874,10 +1877,11 @@ class MainActivity : Activity() {
         stackTarget = n
         stackFrameExpNs = exp
         stackCount = 0
+        stackSubmitted = 0
         stackCancel = false
-        stackSum = cbStackSum.isChecked
+        stackSum = true
         try {
-            val reader = ImageReader.newInstance(stackW, stackH, ImageFormat.YUV_420_888, 3)
+            val reader = ImageReader.newInstance(stackW, stackH, ImageFormat.YUV_420_888, 4)
             reader.setOnImageAvailableListener({ r -> onStackImage(r) }, handler)
             stackReader = reader
             stacking = true
@@ -1899,7 +1903,7 @@ class MainActivity : Activity() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     session = s
                     log("Долгая выдержка: $n кадров, режим " + (if (stackSum) "сумма" else "среднее"))
-                    startFocusRamp { captureStackFrame() }
+                    startFocusRamp { startStackRepeating() }
                 }
                 override fun onConfigureFailed(s: CameraCaptureSession) {
                     log("Сессия не настроилась")
@@ -1916,20 +1920,23 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun captureStackFrame() {
+    // Один повторяющийся запрос: камера снимает кадры подряд, без пауз между ними
+    private fun startStackRepeating() {
         val cam = device
-        val s = session
+        val sess = session
         val reader = stackReader
         val ps = stackSurface
-        if (cam == null || s == null || reader == null || ps == null) return
+        if (cam == null || sess == null || reader == null || ps == null) return
         try {
-            val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+            val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             b.addTarget(reader.surface)
             b.addTarget(ps)
             applyControls(b, false)
-            s.capture(b.build(), null, handler)
+            builder = b
+            sess.setRepeatingRequest(b.build(), null, handler)
+            log("Серия кадров запущена")
         } catch (e: Exception) {
-            log("Ошибка кадра: $e")
+            log("Ошибка серии: $e")
             finishStack()
         }
     }
@@ -1948,7 +1955,10 @@ class MainActivity : Activity() {
         val cnt = stackCount
         val tgt = stackTarget
         runOnUiThread { btnStack.text = "Стоп $cnt/$tgt" }
-        if (stackCancel || cnt >= tgt) finishStack() else captureStackFrame()
+        if (stackCancel || cnt >= tgt) {
+            try { session?.stopRepeating() } catch (_: Exception) {}
+            finishStack()
+        }
     }
 
     private fun accumulate(img: Image) {
@@ -2310,6 +2320,8 @@ class MainActivity : Activity() {
         super.onResume()
         hideSystemUi()
         updateTransform()
+        texture.postDelayed({ updateTransform() }, 300)
+        texture.postDelayed({ updateTransform() }, 900)
         tryAutoOpen()
     }
 
@@ -2370,7 +2382,6 @@ label{display:block;margin:8px 0 2px}
 <label><input type="checkbox" id="cFocus"> Ручной фокус</label>
 <label id="lFocus">Фокус</label><input type="range" id="sFocus" min="0" max="1000">
 <label id="lStack">Долгая выдержка</label><input type="range" id="sStack" min="0" max="118">
-<label><input type="checkbox" id="cSum"> Суммировать (ярче)</label>
 <label><input type="checkbox" id="cFlip"> Перевернуть 180°</label>
 <button id="bAspect">Формат</button>
 <button id="bNr">Шумоподавление</button>
@@ -2424,7 +2435,7 @@ function poll(){
     setSl('sZoom', s.zoom); setSl('sIso', s.iso); setSl('sExp', s.exp);
     setSl('sFocus', s.focus); setSl('sBoost', s.boost); setSl('sStack', s.stack);
     G('cExp').checked = s.manExp; G('cFocus').checked = s.manFocus;
-    G('cFlip').checked = s.flip; G('cSum').checked = s.stackSum;
+    G('cFlip').checked = s.flip;
     G('bAspect').textContent = s.aspect;
     G('bNr').textContent = s.nr;
     G('bEdge').textContent = s.edge;
@@ -2437,7 +2448,7 @@ function poll(){
 }
 slider('sZoom', 'zoom'); slider('sIso', 'iso'); slider('sExp', 'exp');
 slider('sFocus', 'focus'); slider('sBoost', 'boost'); slider('sStack', 'stack');
-check('cExp', 'manExp'); check('cFocus', 'manFocus'); check('cFlip', 'flip'); check('cSum', 'stackSum');
+check('cExp', 'manExp'); check('cFocus', 'manFocus'); check('cFlip', 'flip'); 
 bindClick('bPhoto', 'photo'); bindClick('bStack', 'stack');
 bindClick('bRec', 'rec'); bindClick('bPause', 'pause'); bindClick('bAspect', 'aspect');
 bindClick('bNr', 'nr'); bindClick('bEdge', 'edge'); bindClick('bBit', 'bitrate'); bindClick('bTorch', 'torch');
