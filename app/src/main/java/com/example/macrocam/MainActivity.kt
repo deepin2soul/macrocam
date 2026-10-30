@@ -85,7 +85,9 @@ class MainActivity : Activity() {
     private lateinit var texture: TextureView
     private lateinit var logView: TextView
     private lateinit var logScroll: ScrollView
-    private val cameraId = "3"
+    private var cameraId = "3"
+    private val camIds = arrayOf("3", "0", "4")
+    private lateinit var btnCam: Button
     @Volatile private var opening = false
     private lateinit var sbIso: SeekBar
     private lateinit var sbExp: SeekBar
@@ -270,6 +272,7 @@ class MainActivity : Activity() {
 
         // правая панель настроек
         btnServer = mkBtn("Трансляция: выкл")
+        btnCam = mkBtn("Камера")
         btnTorch = mkBtn("Фонарик: выкл")
         btnSave = mkBtn("Экономия (чёрный экран)")
         btnAspect = mkBtn("Формат: 4:3")
@@ -298,6 +301,7 @@ class MainActivity : Activity() {
         val col = LinearLayout(this)
         col.orientation = LinearLayout.VERTICAL
         col.addView(btnServer)
+        col.addView(btnCam)
         col.addView(btnTorch)
         col.addView(btnSave)
         col.addView(btnAspect)
@@ -382,6 +386,9 @@ class MainActivity : Activity() {
         cbStackSum.isChecked = true
         sbBoost.progress = prefs.getInt("boost", 0)
         mode = prefs.getInt("mode", 0).coerceIn(0, 1)
+        cameraId = prefs.getString("camId", "3") ?: "3"
+        if (!camIds.contains(cameraId)) cameraId = "3"
+        btnCam.text = "Камера: " + camLabel(cameraId)
         updateModeUi()
         nrMode = prefs.getInt("nrMode", -1)
         edgeMode = prefs.getInt("edgeMode", -1)
@@ -435,12 +442,13 @@ class MainActivity : Activity() {
         btnPause.setOnClickListener { togglePause() }
         btnGallery.setOnClickListener { openGallery() }
         btnTorch.setOnClickListener { toggleTorch() }
+        btnCam.setOnClickListener { switchCamera() }
         btnServer.setOnClickListener { toggleServer() }
         btnSave.setOnClickListener { setSaveMode(true) }
         val tapViews = listOf<View>(
             btnPanel, btnMode, btnPhoto, btnStack, btnRec,
             btnAspect, btnNr, btnEdge, btnBitrate, cbExp, cbFocus, cbFlip, cbStackSum,
-            btnPause, btnGallery, btnTorch, btnSave, btnServer
+            btnPause, btnGallery, btnTorch, btnSave, btnServer, btnCam
         )
         for (v in tapViews) {
             v.setOnTouchListener { vv, ev ->
@@ -530,6 +538,7 @@ class MainActivity : Activity() {
             .putInt("boost", sbBoost.progress)
             .putInt("nrMode", nrMode)
             .putInt("mode", mode)
+            .putString("camId", cameraId)
             .putInt("edgeMode", edgeMode)
             .putInt("bitrate", bitrateIdx)
             .putInt("aspect", aspectMode)
@@ -735,10 +744,7 @@ class MainActivity : Activity() {
         return (r.lower + (r.upper - r.lower) * (sbBoost.progress / 1000.0)).toInt()
     }
 
-    private fun currentFocus(): Float {
-        val f = 26f + (10f - 26f) * (sbFocus.progress / 1000f)
-        return if (minFocus > 0f) min(f, minFocus) else f
-    }
+    private fun currentFocus(): Float = (1f - sbFocus.progress / 1000f) * minFocus
 
     private fun currentZoom(): Float =
         maxZoom.toDouble().pow(sbZoom.progress / 1000.0).toFloat()
@@ -933,20 +939,21 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun sizesFor(sizes: Array<Size>?): List<Size> {
+    private fun sizesFor(sizes: Array<Size>?, maxPixels: Int = Int.MAX_VALUE): List<Size> {
         if (sizes == null) return emptyList()
         val target = doubleArrayOf(4.0 / 3.0, 16.0 / 9.0, 20.0 / 9.0)[aspectMode]
         return sizes
+            .filter { it.width.toLong() * it.height <= maxPixels }
             .filter { Math.abs(it.width.toDouble() / it.height - target) < 0.02 }
             .sortedByDescending { it.width * it.height }
     }
 
     private fun computeSizes() {
         val map = streamMap ?: return
-        previewSize = sizesFor(map.getOutputSizes(SurfaceTexture::class.java)).firstOrNull() ?: previewSize
+        previewSize = sizesFor(map.getOutputSizes(SurfaceTexture::class.java), 13_000_000).firstOrNull() ?: previewSize
         videoCandidates = sizesFor(map.getOutputSizes(MediaRecorder::class.java))
         videoSize = videoCandidates.firstOrNull() ?: videoSize
-        photoSize = sizesFor(map.getOutputSizes(ImageFormat.JPEG)).firstOrNull() ?: photoSize
+        photoSize = sizesFor(map.getOutputSizes(ImageFormat.YUV_420_888), 13_000_000).firstOrNull() ?: photoSize
         log(aspectLabel() + ": превью $previewSize, видео $videoSize, фото $photoSize")
         updateTransform()
     }
@@ -1463,6 +1470,7 @@ class MainActivity : Activity() {
         s("edge", btnEdge.text.toString())
         s("bitrate", btnBitrate.text.toString())
         s("torch", btnTorch.text.toString())
+        s("cam", btnCam.text.toString())
         sb.append("\"log\":\"").append(esc(recentLog())).append("\"}")
         return sb.toString()
     }
@@ -1489,6 +1497,7 @@ class MainActivity : Activity() {
                             "edge" -> btnEdge.performClick()
                             "bitrate" -> btnBitrate.performClick()
                             "torch" -> btnTorch.performClick()
+                            "cam" -> btnCam.performClick()
                             else -> {}
                         }
                     }
@@ -1562,6 +1571,24 @@ class MainActivity : Activity() {
             log("Поиск вспышки: $e")
         }
         return null
+    }
+
+    private fun camLabel(id: String): String = when (id) {
+        "3" -> "Макро (3)"
+        "0" -> "Основная (0)"
+        "4" -> "Сверхширокая (4)"
+        else -> id
+    }
+
+    private fun switchCamera() {
+        if (recording || stacking) { log("Сначала остановите запись или долгую выдержку"); return }
+        val i = camIds.indexOf(cameraId)
+        cameraId = camIds[(i + 1) % camIds.size]
+        btnCam.text = "Камера: " + camLabel(cameraId)
+        savePrefs()
+        log("Переключаю на камеру: " + camLabel(cameraId))
+        closeAll()
+        btnCam.postDelayed({ tryAutoOpen() }, 400)
     }
 
     private fun toggleTorch() {
@@ -2418,6 +2445,7 @@ label{display:block;margin:8px 0 2px}
 <button id="bNr">Шумоподавление</button>
 <button id="bEdge">Контуры</button>
 <button id="bBit">Битрейт</button>
+<button id="bCam">Камера</button>
 <button id="bTorch">Фонарик</button>
 <div id="log"></div>
 </div></div>
@@ -2472,6 +2500,7 @@ function poll(){
     G('bEdge').textContent = s.edge;
     G('bBit').textContent = s.bitrate;
     G('bTorch').textContent = s.torch;
+    G('bCam').textContent = s.cam;
     G('v').style.transform = s.flip ? 'rotate(180deg)' : '';
     G('loupe').style.transform = s.flip ? 'translate(-50%,-50%) rotate(180deg)' : 'translate(-50%,-50%)';
     G('log').textContent = s.log;
@@ -2482,7 +2511,7 @@ slider('sFocus', 'focus'); slider('sBoost', 'boost'); slider('sStack', 'stack');
 check('cExp', 'manExp'); check('cFocus', 'manFocus'); check('cFlip', 'flip'); 
 bindClick('bPhoto', 'photo'); bindClick('bStack', 'stack');
 bindClick('bRec', 'rec'); bindClick('bPause', 'pause'); bindClick('bAspect', 'aspect');
-bindClick('bNr', 'nr'); bindClick('bEdge', 'edge'); bindClick('bBit', 'bitrate'); bindClick('bTorch', 'torch');
+bindClick('bNr', 'nr'); bindClick('bEdge', 'edge'); bindClick('bBit', 'bitrate'); bindClick('bTorch', 'torch'); bindClick('bCam', 'cam');
 
 G('v').addEventListener('click', function(e){
   var r = G('v').getBoundingClientRect();
