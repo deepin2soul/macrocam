@@ -6,6 +6,7 @@ import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
@@ -60,6 +61,7 @@ import android.widget.EditText
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
+import android.widget.Toast
 import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.InputStreamReader
@@ -103,6 +105,7 @@ class MainActivity : Activity() {
     private lateinit var cbFlip: CheckBox
     private lateinit var btnRec: Button
     private lateinit var btnAspect: Button
+    private lateinit var btnLogExport: Button
     private lateinit var sbZoom: SeekBar
     private lateinit var tvZoom: TextView
     private lateinit var thread: HandlerThread
@@ -122,6 +125,9 @@ class MainActivity : Activity() {
     private var aspectMode = 0
     private lateinit var btnServer: Button
     private val logBuf = ArrayList<String>()
+    // полный журнал для экспорта (с временем), хранится в памяти до ~100 тыс. символов
+    private val fullLog = StringBuilder()
+    private val logTimeFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
     private var serverSocket: ServerSocket? = null
     @Volatile private var serverOn = false
     private var pin = ""
@@ -323,6 +329,7 @@ class MainActivity : Activity() {
         btnNr = mkBtn("Шумоподавление: авто")
         btnEdge = mkBtn("Контуры: авто")
         btnBitrate = mkBtn("Битрейт: авто")
+        btnLogExport = mkBtn("Экспорт лога")
 
         val col = LinearLayout(this)
         col.orientation = LinearLayout.VERTICAL
@@ -350,6 +357,7 @@ class MainActivity : Activity() {
         col.addView(btnNr)
         col.addView(btnEdge)
         col.addView(btnBitrate)
+        col.addView(btnLogExport)
 
         val panelScroll = ScrollView(this)
         panelScroll.setBackgroundColor(Color.argb(0x99, 0, 0, 0))
@@ -485,7 +493,7 @@ class MainActivity : Activity() {
         btnSave.setOnClickListener { setSaveMode(true) }
         val tapViews = listOf<View>(
             btnPanel, btnMode, btnPhoto, btnStack, btnRec,
-            btnAspect, btnStab, btnNr, btnEdge, btnBitrate, cbExp, cbFocus, cbFlip, cbStackSum,
+            btnAspect, btnStab, btnNr, btnEdge, btnBitrate, btnLogExport, cbExp, cbFocus, cbFlip, cbStackSum,
             btnPause, btnGallery, btnTorch, btnSave, btnServer, btnCam
         )
         for (v in tapViews) {
@@ -531,6 +539,7 @@ class MainActivity : Activity() {
         cbStackSum.setOnCheckedChangeListener { _, _ -> savePrefs() }
         btnAspect.setOnClickListener { toggleAspect() }
         btnStab.setOnClickListener { toggleStabilization() }
+        btnLogExport.setOnClickListener { exportLog() }
         btnPanel.setOnClickListener {
             panel.visibility = if (panel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
         }
@@ -589,10 +598,40 @@ class MainActivity : Activity() {
         synchronized(logBuf) {
             logBuf.add(s)
             if (logBuf.size > 40) logBuf.removeAt(0)
+            fullLog.append(logTimeFmt.format(Date())).append(' ').append(s).append('\n')
+            if (fullLog.length > 100_000) fullLog.delete(0, fullLog.length - 80_000)
         }
         runOnUiThread {
             logView.append(s + "\n")
             logScroll.post { logScroll.fullScroll(ScrollView.FOCUS_DOWN) }
+        }
+    }
+
+    // экспорт всего журнала: копируется в буфер обмена и открывается меню «Поделиться»
+    private fun exportLog() {
+        val header = StringBuilder()
+        header.append("Устройство: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL)
+            .append(", Android ").append(Build.VERSION.RELEASE).append(" (SDK ").append(Build.VERSION.SDK_INT).append(")\n")
+        header.append("Камера id: ").append(cameraId).append("; ").append(aspectLabel())
+            .append("; ").append(stabLabel()).append(" (").append(stabSupportText()).append(")")
+            .append("; превью ").append(previewSize).append(", видео ").append(videoSize).append("\n")
+        header.append("-----\n")
+        val text = synchronized(logBuf) { header.toString() + fullLog.toString() }
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("log", text))
+            Toast.makeText(this, "Лог скопирован в буфер обмена", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            log("Не удалось скопировать лог: $e")
+        }
+        try {
+            val send = Intent(Intent.ACTION_SEND)
+            send.type = "text/plain"
+            send.putExtra(Intent.EXTRA_SUBJECT, "Лог камеры")
+            send.putExtra(Intent.EXTRA_TEXT, text)
+            startActivity(Intent.createChooser(send, "Отправить лог"))
+        } catch (e: Exception) {
+            log("Не удалось открыть меню отправки (лог остался в буфере обмена): $e")
         }
     }
 
