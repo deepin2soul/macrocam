@@ -2,8 +2,11 @@
 <uses-permission android:name="android.permission.CAMERA"/>
 <uses-permission android:name="android.permission.RECORD_AUDIO"/>
 <uses-permission android:name="android.permission.INTERNET"/>
-<application android:label="MacroCam Test" android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
-<activity android:name=".MainActivity" android:exported="true">
+<!-- allowBackup=false: иначе после переустановки восстанавливается ссылка на старый файл, к которому нет доступа -->
+<application android:label="MacroCam Test" android:allowBackup="false" android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+<!-- configChanges: при смене ориентации и возврате из галереи экран не пересоздаётся, превью не растягивается -->
+<activity android:name=".MainActivity" android:exported="true"
+    android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|navigation|density">
 <intent-filter>
 <action android:name="android.intent.action.MAIN"/>
 <category android:name="android.intent.category.LAUNCHER"/>
