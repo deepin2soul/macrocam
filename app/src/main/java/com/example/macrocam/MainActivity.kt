@@ -738,6 +738,7 @@ class MainActivity : Activity() {
             }
         }
         val c = chars ?: return
+        log("Доступные диапазоны FPS: " + c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.joinToString())
         try {
             val req = c.availableCaptureRequestKeys.map { it.name }
             val res = c.availableCaptureResultKeys.map { it.name }
@@ -810,7 +811,7 @@ class MainActivity : Activity() {
         val savedExp = cbExp.isChecked
         if (savedExp) cbExp.isChecked = false
         diagStartGyro()
-        log("=== ТЕСТ СТАБИЛИЗАЦИИ, камера «" + camLabel(cameraId) + "»: три видео по 6 с в 1080p: без стабилизации, со стабилизацией, со стабилизацией и ключом Xiaomi (запись обычным способом) ===")
+        log("=== ТЕСТ СТАБИЛИЗАЦИИ, камера «" + camLabel(cameraId) + "»: три видео по 6 с в 1080p: без стабилизации; со стабилизацией и фиксированными 30 кадр/с; то же плюс ключ Xiaomi ===")
         log("ЧТО ДЕЛАТЬ: держите телефон двумя руками, наведите на предмет с рисунком (книжная полка, ковёр, надписи), не на белую стену. Когда я напишу «КАЧАЙТЕ», плавно и НЕ РЕЗКО качайте телефон влево-вправо небольшими движениями, как при ходьбе, примерно 1-2 раза в секунду, в обоих тестах одинаково. Ничего не нажимайте. Старт через 5 секунд")
         val results = ArrayList<DoubleArray>()
         uiHandler.postDelayed({ diagPhase(0, results, savedStab, savedAspect, savedExp) }, 5000)
@@ -1044,8 +1045,8 @@ class MainActivity : Activity() {
 
     private fun diagVerdict(r: List<DoubleArray>) {
         diagLine("1 БЕЗ стабилизации", r[0])
-        diagLine("2 СО стабилизацией", r[1])
-        diagLine("3 СО стабилизацией + ключ Xiaomi", r[2])
+        diagLine("2 СО стабилизацией + 30 кадр/с", r[1])
+        diagLine("3 СО стабилизацией + 30 кадр/с + ключ Xiaomi", r[2])
         diagCompare("Сравнение 2 с 1", r[0], r[1])
         diagCompare("Сравнение 3 с 1", r[0], r[2])
     }
@@ -1372,12 +1373,33 @@ class MainActivity : Activity() {
     // Стабилизация действует в превью и при записи видео, чтобы эффект был виден сразу;
     // фото и долгая выдержка (stab=false) идут как раньше
     private fun applyStabilization(b: CaptureRequest.Builder) {
+        // фиксированные 30 кадров/с: драйвер выбирает режим камеры по частоте кадров при создании сессии,
+        // и со стабилизацией нужен именно «видеорежим» (при ручной выдержке не трогаем)
+        if (stabOn && !cbExp.isChecked) {
+            try {
+                val ranges = chars?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                val r = ranges?.firstOrNull { it.lower == 30 && it.upper == 30 }
+                if (r != null) b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, r)
+            } catch (e: Exception) {
+                log("Не удалось зафиксировать 30 кадров/с: $e")
+            }
+        }
         if (diagXiaomi && stabOn) {
             try {
                 val k = chars?.availableCaptureRequestKeys?.firstOrNull { it.name == "xiaomi.pro.video.movie.enabled" }
                 if (k != null) {
-                    @Suppress("UNCHECKED_CAST")
-                    b.set(k as CaptureRequest.Key<Byte>, 1.toByte())
+                    var done = false
+                    try {
+                        @Suppress("UNCHECKED_CAST")
+                        b.set(k as CaptureRequest.Key<ByteArray>, byteArrayOf(1))
+                        done = true
+                    } catch (e: Exception) {
+                        log("Ключ Xiaomi как byte[] не принят: $e")
+                    }
+                    if (!done) {
+                        @Suppress("UNCHECKED_CAST")
+                        b.set(k as CaptureRequest.Key<IntArray>, intArrayOf(1))
+                    }
                 }
             } catch (e: Exception) {
                 log("Ключ Xiaomi не установился: $e")
@@ -1520,11 +1542,14 @@ class MainActivity : Activity() {
             val asked = request.get(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE)
             val eis = result.get(CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE)
             val ois = result.get(CaptureResult.LENS_OPTICAL_STABILIZATION_MODE)
-            val key = "$asked/$eis/$ois"
+            val fps = request.get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE)
+            val key = "$asked/$eis/$ois/$fps"
             if (key != lastStabResult) {
                 lastStabResult = key
-                log("Ответ камеры: стабилизация запрошена=$asked, применена=$eis, OIS=$ois, кадр=" +
-                    result.get(CaptureResult.SCALER_CROP_REGION))
+                val dur = result.get(CaptureResult.SENSOR_FRAME_DURATION)
+                log("Ответ камеры: стабилизация запрошена=$asked, применена=$eis, OIS=$ois, FPS запрошено=$fps, " +
+                    "длительность кадра=" + (if (dur != null) (dur / 1000000L).toString() + " мс" else "?") +
+                    ", кадр=" + result.get(CaptureResult.SCALER_CROP_REGION))
             }
         }
     }
