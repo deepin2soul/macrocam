@@ -669,6 +669,8 @@ class MainActivity : Activity() {
     private val uiHandler = Handler(Looper.getMainLooper())
     @Volatile private var diagRunning = false
     private var diagForce1080 = false
+    private var diagLegacy = false   // тест: запись через обычную поверхность MediaRecorder, без постоянной
+    private var diagXiaomi = false   // тест: нестандартный ключ Xiaomi
     private val gyroLock = Any()
     private val gyroTimes = ArrayList<Long>()
     private val gyroVals = ArrayList<Float>()
@@ -753,7 +755,7 @@ class MainActivity : Activity() {
     }
 
     private fun diagRestartCamera() {
-        usePersistent = true
+        usePersistent = !diagLegacy
         if (device != null) {
             try { session?.close() } catch (_: Exception) {}
             session = null
@@ -808,22 +810,24 @@ class MainActivity : Activity() {
         val savedExp = cbExp.isChecked
         if (savedExp) cbExp.isChecked = false
         diagStartGyro()
-        log("=== ТЕСТ СТАБИЛИЗАЦИИ, камера «" + camLabel(cameraId) + "»: два видео по 6 с в 1080p, сначала без стабилизации, потом со стабилизацией ===")
+        log("=== ТЕСТ СТАБИЛИЗАЦИИ, камера «" + camLabel(cameraId) + "»: три видео по 6 с в 1080p: без стабилизации, со стабилизацией, со стабилизацией и ключом Xiaomi (запись обычным способом) ===")
         log("ЧТО ДЕЛАТЬ: держите телефон двумя руками, наведите на предмет с рисунком (книжная полка, ковёр, надписи), не на белую стену. Когда я напишу «КАЧАЙТЕ», плавно и НЕ РЕЗКО качайте телефон влево-вправо небольшими движениями, как при ходьбе, примерно 1-2 раза в секунду, в обоих тестах одинаково. Ничего не нажимайте. Старт через 5 секунд")
         val results = ArrayList<DoubleArray>()
         uiHandler.postDelayed({ diagPhase(0, results, savedStab, savedAspect, savedExp) }, 5000)
     }
 
     private fun diagPhase(i: Int, results: ArrayList<DoubleArray>, ss: Boolean, sa: Int, se: Boolean) {
-        if (i >= 2) { diagFinish(results, ss, sa, se, null); return }
-        val on = (i == 1)
+        if (i >= 3) { diagFinish(results, ss, sa, se, null); return }
+        val on = (i >= 1)
         try {
             stabOn = on
             aspectMode = 1
             diagForce1080 = true
+            diagLegacy = true
+            diagXiaomi = (i == 2)
             btnStab.text = stabLabel()
             btnAspect.text = aspectLabel()
-            log("--- ТЕСТ " + (i + 1) + " из 2: стабилизация " + (if (on) "ВКЛ" else "ВЫКЛ") + ". Перезапускаю камеру, приготовьтесь, запись через 3 секунды ---")
+            log("--- ТЕСТ " + (i + 1) + " из 3: стабилизация " + (if (on) "ВКЛ" else "ВЫКЛ") + (if (i == 2) " + ключ Xiaomi" else "") + ". Перезапускаю камеру, приготовьтесь, запись через 3 секунды ---")
             diagRestartCamera()
         } catch (e: Exception) {
             diagFinish(results, ss, sa, se, "ошибка подготовки: $e")
@@ -982,6 +986,9 @@ class MainActivity : Activity() {
         try {
             diagStopGyro()
             diagForce1080 = false
+            diagLegacy = false
+            diagXiaomi = false
+            usePersistent = true
             stabOn = ss
             aspectMode = sa
             btnStab.text = stabLabel()
@@ -1002,37 +1009,45 @@ class MainActivity : Activity() {
             log("Ошибка при возврате настроек: $e")
         }
         diagRunning = false
-        if (error == null && results.size == 2) diagVerdict(results[0], results[1])
+        if (error == null && results.size == 3) diagVerdict(results)
         log("=== ДИАГНОСТИКА ЗАВЕРШЕНА. Нажмите «Экспорт лога» и пришлите мне ===")
     }
 
-    private fun diagVerdict(off: DoubleArray, on: DoubleArray) {
-        log(String.format(Locale.US, "БЕЗ стабилизации: сдвиг кадра %.1f px/с, тряска телефона %.2f рад/с (%.0f град/с), пар кадров %d, контраст %.0f, упор в предел %.0f%%",
-            off[0], off[1], Math.toDegrees(off[1]), off[2].toInt(), off[3], off[4] * 100))
-        log(String.format(Locale.US, "СО стабилизацией: сдвиг кадра %.1f px/с, тряска телефона %.2f рад/с (%.0f град/с), пар кадров %d, контраст %.0f, упор в предел %.0f%%",
-            on[0], on[1], Math.toDegrees(on[1]), on[2].toInt(), on[3], on[4] * 100))
+    private fun diagLine(name: String, r: DoubleArray) {
+        log(String.format(Locale.US, name + ": сдвиг кадра %.1f px/с, тряска телефона %.2f рад/с (%.0f град/с), пар кадров %d, контраст %.0f, упор в предел %.0f%%",
+            r[0], r[1], Math.toDegrees(r[1]), r[2].toInt(), r[3], r[4] * 100))
+    }
+
+    private fun diagCompare(name: String, off: DoubleArray, on: DoubleArray) {
         var valid = true
-        if (off[3] < 8 || on[3] < 8) { log("ПРОБЛЕМА: в кадре мало деталей (белая стена?)"); valid = false }
-        if (off[1] < 0.15 || on[1] < 0.15) { log("ПРОБЛЕМА: телефон почти не качали хотя бы в одном из тестов"); valid = false }
-        if (off[4] > 0.3 || on[4] > 0.3) { log("ПРОБЛЕМА: качали слишком резко, кадр смещался быстрее, чем я могу измерить"); valid = false }
+        if (off[3] < 8 || on[3] < 8) { log(name + ": ПРОБЛЕМА: в кадре мало деталей"); valid = false }
+        if (off[1] < 0.15 || on[1] < 0.15) { log(name + ": ПРОБЛЕМА: телефон почти не качали"); valid = false }
+        if (off[4] > 0.3 || on[4] > 0.3) { log(name + ": ПРОБЛЕМА: качали слишком резко"); valid = false }
         if (off[1] > 0 && on[1] > 0 && (off[1] / on[1] > 1.8 || on[1] / off[1] > 1.8)) {
-            log("ПРОБЛЕМА: в двух тестах качали сильно по-разному"); valid = false
+            log(name + ": ПРОБЛЕМА: качали сильно по-разному"); valid = false
         }
-        if (!valid) {
-            log("ВЫВОД: ТЕСТ НЕДЕЙСТВИТЕЛЕН, результат ниже ненадёжен. Повторите: плавно, небольшими движениями, одинаково в обоих тестах, на предмет с рисунком")
-        }
+        if (off[1] <= 0 || on[1] <= 0) { log(name + ": нет данных гироскопа"); return }
         val rOff = off[0] / off[1]
         val rOn = on[0] / on[1]
         val ratio = rOn / rOff
-        log(String.format(Locale.US, "Сдвиг кадра на единицу тряски (меньше = лучше): без стабилизации %.1f, со стабилизацией %.1f, отношение %.2f", rOff, rOn, ratio))
-        if (!valid) return
+        val head = String.format(Locale.US, name + ": сдвиг на единицу тряски без стабилизации %.1f, с ней %.1f, отношение %.2f", rOff, rOn, ratio)
+        log(head)
+        if (!valid) { log(name + ": ВЫВОД: измерение ненадёжно, повторите тест"); return }
         if (ratio < 0.75) {
-            log("ВЫВОД: СТАБИЛИЗАЦИЯ РАБОТАЕТ, дрожание кадра меньше примерно на " + ((1 - ratio) * 100).toInt() + "%")
+            log(name + ": ВЫВОД: СТАБИЛИЗАЦИЯ РАБОТАЕТ, дрожание меньше примерно на " + ((1 - ratio) * 100).toInt() + "%")
         } else if (ratio > 1.25) {
-            log("ВЫВОД: со стабилизацией кадр дёргается сильнее; скорее всего, это шум измерения, повторите тест")
+            log(name + ": ВЫВОД: со стабилизацией дёргается сильнее, вероятно, шум измерения")
         } else {
-            log("ВЫВОД: разницы нет. Камера принимает запрос стабилизации, но на запись не применяет")
+            log(name + ": ВЫВОД: разницы нет")
         }
+    }
+
+    private fun diagVerdict(r: List<DoubleArray>) {
+        diagLine("1 БЕЗ стабилизации", r[0])
+        diagLine("2 СО стабилизацией", r[1])
+        diagLine("3 СО стабилизацией + ключ Xiaomi", r[2])
+        diagCompare("Сравнение 2 с 1", r[0], r[1])
+        diagCompare("Сравнение 3 с 1", r[0], r[2])
     }
 
     // ---------- метаданные и звук ----------
@@ -1357,6 +1372,17 @@ class MainActivity : Activity() {
     // Стабилизация действует в превью и при записи видео, чтобы эффект был виден сразу;
     // фото и долгая выдержка (stab=false) идут как раньше
     private fun applyStabilization(b: CaptureRequest.Builder) {
+        if (diagXiaomi && stabOn) {
+            try {
+                val k = chars?.availableCaptureRequestKeys?.firstOrNull { it.name == "xiaomi.pro.video.movie.enabled" }
+                if (k != null) {
+                    @Suppress("UNCHECKED_CAST")
+                    b.set(k as CaptureRequest.Key<Byte>, 1.toByte())
+                }
+            } catch (e: Exception) {
+                log("Ключ Xiaomi не установился: $e")
+            }
+        }
         if (hasEis()) {
             b.set(
                 CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
