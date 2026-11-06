@@ -18,6 +18,10 @@ import android.graphics.Rect
 import android.graphics.YuvImage
 import android.graphics.RectF
 import android.graphics.SurfaceTexture
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.hardware.display.DisplayManager
 import android.hardware.camera2.*
 import android.hardware.camera2.params.OutputConfiguration
@@ -30,6 +34,7 @@ import android.media.AudioTrack
 import android.media.ExifInterface
 import android.media.MediaCodec
 import android.media.MediaCodecList
+import android.media.MediaMetadataRetriever
 import android.media.Image
 import android.media.ImageReader
 import android.media.MediaRecorder
@@ -38,6 +43,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.os.SystemClock
 import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import android.util.Range
@@ -108,6 +114,7 @@ class MainActivity : Activity() {
     private lateinit var btnRec: Button
     private lateinit var btnAspect: Button
     private lateinit var btnLogExport: Button
+    private lateinit var btnDiag: Button
     private lateinit var sbZoom: SeekBar
     private lateinit var tvZoom: TextView
     private lateinit var thread: HandlerThread
@@ -332,6 +339,7 @@ class MainActivity : Activity() {
         btnEdge = mkBtn("Контуры: авто")
         btnBitrate = mkBtn("Битрейт: авто")
         btnLogExport = mkBtn("Экспорт лога")
+        btnDiag = mkBtn("Тест стабилизации")
 
         val col = LinearLayout(this)
         col.orientation = LinearLayout.VERTICAL
@@ -359,6 +367,7 @@ class MainActivity : Activity() {
         col.addView(btnNr)
         col.addView(btnEdge)
         col.addView(btnBitrate)
+        col.addView(btnDiag)
         col.addView(btnLogExport)
 
         val panelScroll = ScrollView(this)
@@ -465,6 +474,7 @@ class MainActivity : Activity() {
 
         btnPhoto.setOnClickListener { takePhoto() }
         btnRec.setOnClickListener {
+            if (diagRunning) { log("Идёт тест стабилизации, подождите"); return@setOnClickListener }
             if (recording) stopRecording() else startRecording()
         }
 
@@ -477,7 +487,17 @@ class MainActivity : Activity() {
                 }
             }
             override fun onStartTrackingTouch(s: SeekBar?) {}
-            override fun onStopTrackingTouch(s: SeekBar?) {}
+            override fun onStopTrackingTouch(s: SeekBar?) {
+                val name = when (s) {
+                    sbIso -> "ISO"
+                    sbExp -> "Выдержка"
+                    sbFocus -> "Фокус"
+                    sbZoom -> "Зум"
+                    sbStack -> "Долгая выдержка"
+                    else -> "ползунок"
+                }
+                log("Ползунок «" + name + "» = " + s?.progress)
+            }
         }
         sbIso.setOnSeekBarChangeListener(seekListener)
         sbExp.setOnSeekBarChangeListener(seekListener)
@@ -495,12 +515,13 @@ class MainActivity : Activity() {
         btnSave.setOnClickListener { setSaveMode(true) }
         val tapViews = listOf<View>(
             btnPanel, btnMode, btnPhoto, btnStack, btnRec,
-            btnAspect, btnStab, btnNr, btnEdge, btnBitrate, btnLogExport, cbExp, cbFocus, cbFlip, cbStackSum,
+            btnAspect, btnStab, btnNr, btnEdge, btnBitrate, btnDiag, btnLogExport, cbExp, cbFocus, cbFlip, cbStackSum,
             btnPause, btnGallery, btnTorch, btnSave, btnServer, btnCam
         )
         for (v in tapViews) {
             v.setOnTouchListener { vv, ev ->
                 if (ev.action == MotionEvent.ACTION_DOWN) {
+                    log("Нажато: " + describeTap(vv))
                     vv.performHapticFeedback(
                         HapticFeedbackConstants.KEYBOARD_TAP,
                         HapticFeedbackConstants.FLAG_IGNORE_GLOBAL_SETTING
@@ -542,6 +563,7 @@ class MainActivity : Activity() {
         btnAspect.setOnClickListener { toggleAspect() }
         btnStab.setOnClickListener { toggleStabilization() }
         btnLogExport.setOnClickListener { exportLog() }
+        btnDiag.setOnClickListener { startDiag() }
         btnPanel.setOnClickListener {
             panel.visibility = if (panel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
         }
@@ -596,6 +618,11 @@ class MainActivity : Activity() {
             .apply()
     }
 
+    private fun describeTap(v: View): String {
+        val name = (v as? TextView)?.text?.toString() ?: v.javaClass.simpleName
+        return if (v is CheckBox) "«" + name + "» (было: " + (if (v.isChecked) "вкл" else "выкл") + ")" else "«" + name + "»"
+    }
+
     private fun log(s: String) {
         synchronized(logBuf) {
             logBuf.add(s)
@@ -634,6 +661,326 @@ class MainActivity : Activity() {
             startActivity(Intent.createChooser(send, "Отправить лог"))
         } catch (e: Exception) {
             log("Не удалось открыть меню отправки (лог остался в буфере обмена): $e")
+        }
+    }
+
+    // ---------- автоматическая диагностика стабилизации ----------
+
+    private val uiHandler = Handler(Looper.getMainLooper())
+    @Volatile private var diagRunning = false
+    private var diagForce1080 = false
+    private val gyroLock = Any()
+    private val gyroTimes = ArrayList<Long>()
+    private val gyroVals = ArrayList<Float>()
+    private var gyroListener: SensorEventListener? = null
+
+    private fun diagStartGyro() {
+        try {
+            val sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+            val g = sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+            if (g == null) { log("Гироскопа нет, тест будет менее точным"); return }
+            synchronized(gyroLock) { gyroTimes.clear(); gyroVals.clear() }
+            val l = object : SensorEventListener {
+                override fun onSensorChanged(e: SensorEvent) {
+                    val x = e.values[0].toDouble()
+                    val y = e.values[1].toDouble()
+                    val z = e.values[2].toDouble()
+                    val v = Math.sqrt(x * x + y * y + z * z).toFloat()
+                    synchronized(gyroLock) {
+                        gyroTimes.add(SystemClock.elapsedRealtime())
+                        gyroVals.add(v)
+                        if (gyroTimes.size > 20000) { gyroTimes.removeAt(0); gyroVals.removeAt(0) }
+                    }
+                }
+                override fun onAccuracyChanged(s: Sensor?, a: Int) {}
+            }
+            gyroListener = l
+            sm.registerListener(l, g, SensorManager.SENSOR_DELAY_GAME)
+        } catch (e: Exception) {
+            log("Не удалось включить гироскоп: $e")
+        }
+    }
+
+    private fun diagStopGyro() {
+        val l = gyroListener ?: return
+        try { (getSystemService(Context.SENSOR_SERVICE) as SensorManager).unregisterListener(l) } catch (_: Exception) {}
+        gyroListener = null
+    }
+
+    // средняя угловая скорость телефона (рад/с) за интервал; -1, если данных нет
+    private fun gyroMean(t0: Long, t1: Long): Double {
+        synchronized(gyroLock) {
+            var s = 0.0
+            var n = 0
+            for (i in gyroTimes.indices) {
+                if (gyroTimes[i] >= t0 && gyroTimes[i] <= t1) { s += gyroVals[i]; n++ }
+            }
+            return if (n > 0) s / n else -1.0
+        }
+    }
+
+    // что камера умеет и какие нестандартные (вендорские) ключи у неё есть
+    private fun diagDumpKeys() {
+        log("=== ДИАГНОСТИКА: возможности камер ===")
+        try {
+            for (id in cm.cameraIdList) {
+                val c = cm.getCameraCharacteristics(id)
+                val face = c.get(CameraCharacteristics.LENS_FACING)
+                val eis = c.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)?.joinToString()
+                val ois = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)?.joinToString()
+                val level = c.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)
+                log("камера $id: facing=$face, уровень=$level, EIS=[$eis], OIS=[$ois]")
+            }
+        } catch (e: Exception) {
+            log("Не удалось опросить список камер: $e")
+        }
+        val c = chars ?: return
+        try {
+            val req = c.availableCaptureRequestKeys.map { it.name }
+            val res = c.availableCaptureResultKeys.map { it.name }
+            log("Ключи запроса: всего " + req.size + "; не android.*: " + req.filter { !it.startsWith("android.") }.joinToString())
+            log("Ключи ответа: всего " + res.size + "; не android.*: " + res.filter { !it.startsWith("android.") }.joinToString())
+            if (Build.VERSION.SDK_INT >= 28) {
+                val ses = c.availableSessionKeys?.map { it.name } ?: emptyList()
+                log("Ключи сессии (" + ses.size + "): " + ses.joinToString())
+            }
+            val rx = Regex("stabil|shake|gyro|[._](eis|ois)", RegexOption.IGNORE_CASE)
+            log("Ключи про стабилизацию: " + (req + res).distinct().filter { rx.containsMatchIn(it) }.joinToString())
+        } catch (e: Exception) {
+            log("Не удалось получить список ключей: $e")
+        }
+    }
+
+    private fun diagRestartCamera() {
+        usePersistent = true
+        if (device != null) {
+            try { session?.close() } catch (_: Exception) {}
+            session = null
+            computeSizes()
+            startPreview()
+        } else {
+            computeSizes()
+        }
+    }
+
+    private fun startDiag() {
+        if (diagRunning) { log("Диагностика уже идёт"); return }
+        if (recording || stacking) { log("Сначала остановите запись или долгую выдержку"); return }
+        if (device == null) { log("Сначала откройте камеру"); return }
+        diagRunning = true
+        diagDumpKeys()
+        val savedStab = stabOn
+        val savedAspect = aspectMode
+        val savedExp = cbExp.isChecked
+        if (savedExp) cbExp.isChecked = false
+        diagStartGyro()
+        log("=== ТЕСТ СТАБИЛИЗАЦИИ (камера $cameraId): два видео по 6 с в 1080p, сначала без стабилизации, потом со стабилизацией ===")
+        log("ЧТО ДЕЛАТЬ: держите телефон двумя руками, наведите на предмет с рисунком (книжная полка, ковёр, надписи), не на белую стену. Когда я напишу «КАЧАЙТЕ», плавно качайте телефон влево-вправо 2-3 раза в секунду, в обоих тестах одинаково. Ничего не нажимайте. Старт через 5 секунд")
+        val results = ArrayList<DoubleArray>()
+        uiHandler.postDelayed({ diagPhase(0, results, savedStab, savedAspect, savedExp) }, 5000)
+    }
+
+    private fun diagPhase(i: Int, results: ArrayList<DoubleArray>, ss: Boolean, sa: Int, se: Boolean) {
+        if (i >= 2) { diagFinish(results, ss, sa, se, null); return }
+        val on = (i == 1)
+        try {
+            stabOn = on
+            aspectMode = 1
+            diagForce1080 = true
+            btnStab.text = stabLabel()
+            btnAspect.text = aspectLabel()
+            log("--- ТЕСТ " + (i + 1) + " из 2: стабилизация " + (if (on) "ВКЛ" else "ВЫКЛ") + ". Перезапускаю камеру, приготовьтесь, запись через 3 секунды ---")
+            diagRestartCamera()
+        } catch (e: Exception) {
+            diagFinish(results, ss, sa, se, "ошибка подготовки: $e")
+            return
+        }
+        uiHandler.postDelayed({
+            log(">>> КАЧАЙТЕ ТЕЛЕФОН влево-вправо, идёт запись 6 секунд <<<")
+            lastStabResult = ""
+            startRecording()
+            diagWaitRecording(i, results, ss, sa, se, 0)
+        }, 3000)
+    }
+
+    private fun diagWaitRecording(i: Int, results: ArrayList<DoubleArray>, ss: Boolean, sa: Int, se: Boolean, waited: Int) {
+        if (recording) {
+            val uri = videoUri
+            val t0 = SystemClock.elapsedRealtime()
+            uiHandler.postDelayed({
+                val t1 = SystemClock.elapsedRealtime()
+                try {
+                    if (recording) stopRecording()
+                } catch (e: Exception) {
+                    log("Ошибка остановки записи: $e")
+                }
+                if (uri == null) {
+                    diagFinish(results, ss, sa, se, "не удалось получить файл видео")
+                } else {
+                    log("Запись остановлена, анализирую видео (до минуты), можно опустить телефон")
+                    Thread {
+                        val r = try { diagAnalyze(uri, t0, t1) } catch (e: Throwable) { log("Ошибка анализа: $e"); null }
+                        uiHandler.post {
+                            if (r == null) {
+                                diagFinish(results, ss, sa, se, "не удалось проанализировать видео")
+                            } else {
+                                results.add(r)
+                                log("Тест " + (i + 1) + " проанализирован")
+                                uiHandler.postDelayed({ diagPhase(i + 1, results, ss, sa, se) }, 3000)
+                            }
+                        }
+                    }.start()
+                }
+            }, 6000)
+        } else if (waited < 50) {
+            uiHandler.postDelayed({ diagWaitRecording(i, results, ss, sa, se, waited + 1) }, 100)
+        } else {
+            diagFinish(results, ss, sa, se, "запись не началась (см. сообщения выше)")
+        }
+    }
+
+    private fun diagLuma(b: Bitmap, w: Int, h: Int): IntArray {
+        val px = IntArray(w * h)
+        b.getPixels(px, 0, w, 0, 0, w, h)
+        val out = IntArray(w * h)
+        for (k in px.indices) {
+            val c = px[k]
+            out[k] = (((c shr 16) and 255) * 77 + ((c shr 8) and 255) * 150 + (c and 255) * 29) shr 8
+        }
+        return out
+    }
+
+    private fun diagContrast(l: IntArray): Double {
+        var s = 0.0
+        for (v in l) s += v
+        val m = s / l.size
+        var q = 0.0
+        for (v in l) q += (v - m) * (v - m)
+        return Math.sqrt(q / l.size)
+    }
+
+    // сдвиг между двумя кадрами в пикселях (поиск лучшего совпадения); при равенстве выбирается нулевой сдвиг
+    private fun diagShift(a: IntArray, b: IntArray, w: Int, h: Int, r: Int): Double {
+        fun sadAt(dx: Int, dy: Int): Long {
+            var sad = 0L
+            var y = r
+            while (y < h - r) {
+                var x = r
+                while (x < w - r) {
+                    sad += Math.abs(a[y * w + x] - b[(y + dy) * w + (x + dx)])
+                    x += 2
+                }
+                y += 2
+            }
+            return sad
+        }
+        var best = sadAt(0, 0)
+        var bx = 0
+        var by = 0
+        for (dy in -r..r) {
+            for (dx in -r..r) {
+                val s = sadAt(dx, dy)
+                if (s < best) { best = s; bx = dx; by = dy }
+            }
+        }
+        return Math.hypot(bx.toDouble(), by.toDouble())
+    }
+
+    // читает записанное видео и меряет, насколько кадр смещается; возвращает
+    // [сдвиг px/с, тряска телефона рад/с, пар кадров, контраст, доля упора в предел]
+    private fun diagAnalyze(uri: Uri, g0: Long, g1: Long): DoubleArray? {
+        val mmr = MediaMetadataRetriever()
+        try {
+            mmr.setDataSource(this, uri)
+            val durMs = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: return null
+            val step = 70L
+            val r = 8
+            var prev: IntArray? = null
+            var pw = 0
+            var ph = 0
+            var sum = 0.0
+            var pairs = 0
+            var sat = 0
+            var contrast = 0.0
+            var frames = 0
+            var t = 700L
+            while (t < durMs - 300) {
+                val bmp: Bitmap? = if (Build.VERSION.SDK_INT >= 27) {
+                    mmr.getScaledFrameAtTime(t * 1000, MediaMetadataRetriever.OPTION_CLOSEST, 128, 72)
+                } else {
+                    mmr.getFrameAtTime(t * 1000, MediaMetadataRetriever.OPTION_CLOSEST)?.let { Bitmap.createScaledBitmap(it, 128, 72, true) }
+                }
+                if (bmp != null) {
+                    val bw = bmp.width
+                    val bh = bmp.height
+                    val l = diagLuma(bmp, bw, bh)
+                    frames++
+                    contrast += diagContrast(l)
+                    val p = prev
+                    if (p != null && pw == bw && ph == bh) {
+                        val d = diagShift(p, l, bw, bh, r)
+                        sum += d
+                        if (d >= r) sat++
+                        pairs++
+                    }
+                    prev = l
+                    pw = bw
+                    ph = bh
+                }
+                t += step
+            }
+            if (pairs < 10) {
+                log("Мало кадров для анализа: пар $pairs из длительности $durMs мс")
+                return null
+            }
+            val gyro = gyroMean(g0 + 700, g0 + durMs - 300)
+            return doubleArrayOf(sum / pairs / (step / 1000.0), gyro, pairs.toDouble(), contrast / frames, sat.toDouble() / pairs)
+        } finally {
+            try { mmr.release() } catch (_: Exception) {}
+        }
+    }
+
+    private fun diagFinish(results: ArrayList<DoubleArray>, ss: Boolean, sa: Int, se: Boolean, error: String?) {
+        if (error != null) log("ТЕСТ ПРЕРВАН: $error")
+        try {
+            if (recording) stopRecording()
+        } catch (_: Exception) {}
+        try {
+            diagStopGyro()
+            diagForce1080 = false
+            stabOn = ss
+            aspectMode = sa
+            btnStab.text = stabLabel()
+            btnAspect.text = aspectLabel()
+            if (se) cbExp.isChecked = true
+            savePrefs()
+            diagRestartCamera()
+        } catch (e: Exception) {
+            log("Ошибка при возврате настроек: $e")
+        }
+        diagRunning = false
+        if (error == null && results.size == 2) diagVerdict(results[0], results[1])
+        log("=== ДИАГНОСТИКА ЗАВЕРШЕНА. Нажмите «Экспорт лога» и пришлите мне ===")
+    }
+
+    private fun diagVerdict(off: DoubleArray, on: DoubleArray) {
+        log(String.format(Locale.US, "БЕЗ стабилизации: сдвиг кадра %.1f px/с, тряска телефона %.2f рад/с (%.0f град/с), пар кадров %d, контраст %.0f, упор в предел %.0f%%",
+            off[0], off[1], Math.toDegrees(off[1]), off[2].toInt(), off[3], off[4] * 100))
+        log(String.format(Locale.US, "СО стабилизацией: сдвиг кадра %.1f px/с, тряска телефона %.2f рад/с (%.0f град/с), пар кадров %d, контраст %.0f, упор в предел %.0f%%",
+            on[0], on[1], Math.toDegrees(on[1]), on[2].toInt(), on[3], on[4] * 100))
+        if (off[3] < 8 || on[3] < 8) log("ВНИМАНИЕ: в кадре мало деталей (белая стена?), результат ненадёжен")
+        if (off[1] <= 0 || on[1] <= 0) { log("Нет данных гироскопа, сравнить нельзя"); return }
+        if (off[1] < 0.25 || on[1] < 0.25) log("ВНИМАНИЕ: телефон качали слишком слабо, результат ненадёжен, повторите тест, качая сильнее")
+        val rOff = off[0] / off[1]
+        val rOn = on[0] / on[1]
+        val ratio = rOn / rOff
+        log(String.format(Locale.US, "Сдвиг кадра на единицу тряски (меньше = лучше): без стабилизации %.1f, со стабилизацией %.1f, отношение %.2f", rOff, rOn, ratio))
+        if (ratio < 0.75) {
+            log("ВЫВОД: СТАБИЛИЗАЦИЯ РАБОТАЕТ, дрожание кадра меньше примерно на " + ((1 - ratio) * 100).toInt() + "%")
+        } else if (ratio > 1.25) {
+            log("ВЫВОД: со стабилизацией кадр дёргается сильнее; скорее всего, это шум измерения, повторите тест")
+        } else {
+            log("ВЫВОД: разницы нет. Камера принимает запрос стабилизации, но на запись не применяет")
         }
     }
 
@@ -926,6 +1273,7 @@ class MainActivity : Activity() {
         "электронная " + (if (hasEis()) "есть" else "нет") + ", оптическая " + (if (hasOis()) "есть" else "нет")
 
     private fun toggleStabilization() {
+        if (diagRunning) { log("Идёт тест стабилизации, подождите"); return }
         if (recording || stacking) { log("Сначала остановите запись или долгую выдержку"); return }
         stabOn = !stabOn
         btnStab.text = stabLabel()
@@ -1223,7 +1571,7 @@ class MainActivity : Activity() {
     private fun computeSizes() {
         val map = streamMap ?: return
         // со стабилизацией (16:9) превью и видео ограничены 1920x1080
-        val stab1080 = stabOn && aspectMode == 1
+        val stab1080 = (stabOn || diagForce1080) && aspectMode == 1
         previewSize = sizesFor(map.getOutputSizes(SurfaceTexture::class.java), if (stab1080) 1920 * 1080 else 13_000_000).firstOrNull() ?: previewSize
         // видео: не больше 4K (8,3 Мпикс), только размеры, которые тянет кодер, и не помеченные как сбойные
         val vids = sizesFor(map.getOutputSizes(MediaRecorder::class.java), if (stab1080) 1920 * 1080 else 3840 * 2160)
@@ -1332,6 +1680,7 @@ class MainActivity : Activity() {
     }
 
     private fun toggleAspect() {
+        if (diagRunning) { log("Идёт тест стабилизации, подождите"); return }
         if (recording || stacking) { log("Сначала остановите запись или долгую выдержку"); return }
         aspectMode = (aspectMode + 1) % 3
         usePersistent = true
