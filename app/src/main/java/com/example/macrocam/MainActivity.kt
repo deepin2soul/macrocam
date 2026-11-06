@@ -722,17 +722,18 @@ class MainActivity : Activity() {
     // что камера умеет и какие нестандартные (вендорские) ключи у неё есть
     private fun diagDumpKeys() {
         log("=== ДИАГНОСТИКА: возможности камер ===")
-        try {
-            for (id in cm.cameraIdList) {
+        val allIds = try { (cm.cameraIdList.toList() + camIds.toList()).distinct() } catch (e: Exception) { camIds.toList() }
+        for (id in allIds) {
+            try {
                 val c = cm.getCameraCharacteristics(id)
                 val face = c.get(CameraCharacteristics.LENS_FACING)
                 val eis = c.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)?.joinToString()
                 val ois = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)?.joinToString()
                 val level = c.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)
                 log("камера $id: facing=$face, уровень=$level, EIS=[$eis], OIS=[$ois]")
+            } catch (e: Exception) {
+                log("камера $id: не удалось опросить ($e)")
             }
-        } catch (e: Exception) {
-            log("Не удалось опросить список камер: $e")
         }
         val c = chars ?: return
         try {
@@ -763,19 +764,52 @@ class MainActivity : Activity() {
         }
     }
 
+    private var diagSavedCam = "3"
+    private val diagCam = "0"   // тест идёт на основной камере
+
     private fun startDiag() {
         if (diagRunning) { log("Диагностика уже идёт"); return }
         if (recording || stacking) { log("Сначала остановите запись или долгую выдержку"); return }
         if (device == null) { log("Сначала откройте камеру"); return }
         diagRunning = true
+        diagSavedCam = cameraId
+        diagSwitchCamera(diagCam) { diagBegin() }
+    }
+
+    // переключает камеру на нужную и вызывает onReady, когда она открыта
+    private fun diagSwitchCamera(id: String, onReady: () -> Unit) {
+        if (cameraId == id && device != null) { onReady(); return }
+        cameraId = id
+        btnCam.text = "Камера: " + camLabel(id)
+        savePrefs()
+        log("Тест идёт на камере «" + camLabel(id) + "», переключаю...")
+        closeAll()
+        uiHandler.postDelayed({
+            tryAutoOpen()
+            diagWaitOpen(0, onReady)
+        }, 600)
+    }
+
+    private fun diagWaitOpen(waited: Int, onReady: () -> Unit) {
+        if (device != null && !opening) {
+            uiHandler.postDelayed({ onReady() }, 1000)
+        } else if (waited < 60) {
+            uiHandler.postDelayed({ diagWaitOpen(waited + 1, onReady) }, 100)
+        } else {
+            log("Камера не открылась, тест отменён")
+            diagRunning = false
+        }
+    }
+
+    private fun diagBegin() {
         diagDumpKeys()
         val savedStab = stabOn
         val savedAspect = aspectMode
         val savedExp = cbExp.isChecked
         if (savedExp) cbExp.isChecked = false
         diagStartGyro()
-        log("=== ТЕСТ СТАБИЛИЗАЦИИ (камера $cameraId): два видео по 6 с в 1080p, сначала без стабилизации, потом со стабилизацией ===")
-        log("ЧТО ДЕЛАТЬ: держите телефон двумя руками, наведите на предмет с рисунком (книжная полка, ковёр, надписи), не на белую стену. Когда я напишу «КАЧАЙТЕ», плавно качайте телефон влево-вправо 2-3 раза в секунду, в обоих тестах одинаково. Ничего не нажимайте. Старт через 5 секунд")
+        log("=== ТЕСТ СТАБИЛИЗАЦИИ, камера «" + camLabel(cameraId) + "»: два видео по 6 с в 1080p, сначала без стабилизации, потом со стабилизацией ===")
+        log("ЧТО ДЕЛАТЬ: держите телефон двумя руками, наведите на предмет с рисунком (книжная полка, ковёр, надписи), не на белую стену. Когда я напишу «КАЧАЙТЕ», плавно и НЕ РЕЗКО качайте телефон влево-вправо небольшими движениями, как при ходьбе, примерно 1-2 раза в секунду, в обоих тестах одинаково. Ничего не нажимайте. Старт через 5 секунд")
         val results = ArrayList<DoubleArray>()
         uiHandler.postDelayed({ diagPhase(0, results, savedStab, savedAspect, savedExp) }, 5000)
     }
@@ -893,8 +927,8 @@ class MainActivity : Activity() {
         try {
             mmr.setDataSource(this, uri)
             val durMs = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: return null
-            val step = 70L
-            val r = 8
+            val step = 40L
+            val r = 10
             var prev: IntArray? = null
             var pw = 0
             var ph = 0
@@ -954,7 +988,16 @@ class MainActivity : Activity() {
             btnAspect.text = aspectLabel()
             if (se) cbExp.isChecked = true
             savePrefs()
-            diagRestartCamera()
+            if (cameraId != diagSavedCam) {
+                cameraId = diagSavedCam
+                btnCam.text = "Камера: " + camLabel(cameraId)
+                savePrefs()
+                log("Возвращаю камеру «" + camLabel(cameraId) + "»")
+                closeAll()
+                uiHandler.postDelayed({ tryAutoOpen() }, 600)
+            } else {
+                diagRestartCamera()
+            }
         } catch (e: Exception) {
             log("Ошибка при возврате настроек: $e")
         }
@@ -968,13 +1011,21 @@ class MainActivity : Activity() {
             off[0], off[1], Math.toDegrees(off[1]), off[2].toInt(), off[3], off[4] * 100))
         log(String.format(Locale.US, "СО стабилизацией: сдвиг кадра %.1f px/с, тряска телефона %.2f рад/с (%.0f град/с), пар кадров %d, контраст %.0f, упор в предел %.0f%%",
             on[0], on[1], Math.toDegrees(on[1]), on[2].toInt(), on[3], on[4] * 100))
-        if (off[3] < 8 || on[3] < 8) log("ВНИМАНИЕ: в кадре мало деталей (белая стена?), результат ненадёжен")
-        if (off[1] <= 0 || on[1] <= 0) { log("Нет данных гироскопа, сравнить нельзя"); return }
-        if (off[1] < 0.25 || on[1] < 0.25) log("ВНИМАНИЕ: телефон качали слишком слабо, результат ненадёжен, повторите тест, качая сильнее")
+        var valid = true
+        if (off[3] < 8 || on[3] < 8) { log("ПРОБЛЕМА: в кадре мало деталей (белая стена?)"); valid = false }
+        if (off[1] < 0.15 || on[1] < 0.15) { log("ПРОБЛЕМА: телефон почти не качали хотя бы в одном из тестов"); valid = false }
+        if (off[4] > 0.3 || on[4] > 0.3) { log("ПРОБЛЕМА: качали слишком резко, кадр смещался быстрее, чем я могу измерить"); valid = false }
+        if (off[1] > 0 && on[1] > 0 && (off[1] / on[1] > 1.8 || on[1] / off[1] > 1.8)) {
+            log("ПРОБЛЕМА: в двух тестах качали сильно по-разному"); valid = false
+        }
+        if (!valid) {
+            log("ВЫВОД: ТЕСТ НЕДЕЙСТВИТЕЛЕН, результат ниже ненадёжен. Повторите: плавно, небольшими движениями, одинаково в обоих тестах, на предмет с рисунком")
+        }
         val rOff = off[0] / off[1]
         val rOn = on[0] / on[1]
         val ratio = rOn / rOff
         log(String.format(Locale.US, "Сдвиг кадра на единицу тряски (меньше = лучше): без стабилизации %.1f, со стабилизацией %.1f, отношение %.2f", rOff, rOn, ratio))
+        if (!valid) return
         if (ratio < 0.75) {
             log("ВЫВОД: СТАБИЛИЗАЦИЯ РАБОТАЕТ, дрожание кадра меньше примерно на " + ((1 - ratio) * 100).toInt() + "%")
         } else if (ratio > 1.25) {
