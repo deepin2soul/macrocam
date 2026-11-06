@@ -17,6 +17,7 @@ import android.graphics.Rect
 import android.graphics.YuvImage
 import android.graphics.RectF
 import android.graphics.SurfaceTexture
+import android.hardware.display.DisplayManager
 import android.hardware.camera2.*
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.CamcorderProfile
@@ -32,6 +33,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import android.util.Range
@@ -168,6 +170,12 @@ class MainActivity : Activity() {
     private var nrMode = -1
     private var edgeMode = -1
     private lateinit var btnBitrate: Button
+    private lateinit var btnStab: Button
+    private var stabOn = true
+    // для растянутого превью после возврата из галереи
+    private var lastLandscapeDeg = 90
+    private var appliedTransformKey = ""
+    private var frameCounter = 0
     private val bitrates = intArrayOf(0, 20, 40, 80)
     private var bitrateIdx = 0
     private lateinit var sbStack: SeekBar
@@ -249,7 +257,7 @@ class MainActivity : Activity() {
         texture = TextureView(this)
         root.addView(texture, FrameLayout.LayoutParams(match, match))
 
-        // левая колонка, всегда на экране
+        // колонка кнопок съёмки, теперь справа, всегда на экране
         btnPanel = mkBtn("Панель")
         btnMode = mkBtn("Режим")
         btnPhoto = mkBtn("Фото")
@@ -258,24 +266,25 @@ class MainActivity : Activity() {
         btnPause = mkBtn("Пауза")
         btnPause.visibility = View.GONE
         btnGallery = mkBtn("Галерея")
-        val left = LinearLayout(this)
-        left.orientation = LinearLayout.VERTICAL
-        left.addView(btnRec)
-        left.addView(btnPause)
-        left.addView(btnPhoto)
-        left.addView(btnStack)
-        left.addView(btnPanel)
-        left.addView(btnGallery)
-        val leftLp = FrameLayout.LayoutParams(wrap, wrap, Gravity.START or Gravity.CENTER_VERTICAL)
-        leftLp.leftMargin = dp(8)
-        root.addView(left, leftLp)
+        val actions = LinearLayout(this)
+        actions.orientation = LinearLayout.VERTICAL
+        actions.addView(btnRec)
+        actions.addView(btnPause)
+        actions.addView(btnPhoto)
+        actions.addView(btnStack)
+        actions.addView(btnPanel)
+        actions.addView(btnGallery)
+        val actionsLp = FrameLayout.LayoutParams(wrap, wrap, Gravity.END or Gravity.CENTER_VERTICAL)
+        actionsLp.rightMargin = dp(8)
+        root.addView(actions, actionsLp)
 
-        // правая панель настроек
+        // панель настроек, теперь слева
         btnServer = mkBtn("Трансляция: выкл")
         btnCam = mkBtn("Камера")
         btnTorch = mkBtn("Фонарик: выкл")
         btnSave = mkBtn("Экономия (чёрный экран)")
         btnAspect = mkBtn("Формат: 4:3")
+        btnStab = mkBtn("Стабилизация: вкл")
         cbFlip = mkCb("Перевернуть 180°")
         tvZoom = mkTv("Зум")
         sbZoom = mkSb(1000, 0)
@@ -305,6 +314,7 @@ class MainActivity : Activity() {
         col.addView(btnTorch)
         col.addView(btnSave)
         col.addView(btnAspect)
+        col.addView(btnStab)
         col.addView(cbFlip)
         col.addView(tvZoom)
         col.addView(sbZoom)
@@ -329,17 +339,17 @@ class MainActivity : Activity() {
         panelScroll.setPadding(dp(8), dp(8), dp(8), dp(8))
         panelScroll.addView(col)
         panel = panelScroll
-        root.addView(panelScroll, FrameLayout.LayoutParams(dp(320), match, Gravity.END))
+        root.addView(panelScroll, FrameLayout.LayoutParams(dp(320), match, Gravity.START))
 
-        // лог внизу слева
+        // лог внизу справа, левее колонки кнопок
         logView = TextView(this)
         logView.setTextColor(Color.WHITE)
         logView.textSize = 11f
         logScroll = ScrollView(this)
         logScroll.setBackgroundColor(Color.argb(0x66, 0, 0, 0))
         logScroll.addView(logView)
-        val logLp = FrameLayout.LayoutParams(dp(380), dp(64), Gravity.BOTTOM or Gravity.START)
-        logLp.leftMargin = dp(96)
+        val logLp = FrameLayout.LayoutParams(dp(380), dp(88), Gravity.BOTTOM or Gravity.END)
+        logLp.rightMargin = dp(116)
         root.addView(logScroll, logLp)
 
         // чёрный экран для экономии батареи (поверх всего)
@@ -395,6 +405,8 @@ class MainActivity : Activity() {
         updateModeButtons()
         bitrateIdx = prefs.getInt("bitrate", 0).coerceIn(0, bitrates.size - 1)
         btnBitrate.text = bitrateLabel()
+        stabOn = prefs.getBoolean("stab", true)
+        btnStab.text = stabLabel()
         cbExp.isChecked = prefs.getBoolean("manExp", false)
         cbFocus.isChecked = prefs.getBoolean("manFocus", false)
         cbFlip.isChecked = prefs.getBoolean("flip", false)
@@ -412,7 +424,11 @@ class MainActivity : Activity() {
                 updateTransform()
             }
             override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean = true
-            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {
+                // самолечение: раз в 10 кадров проверяем, не устарела ли матрица превью
+                // (после возврата из галереи система могла сообщить неверный поворот или размер)
+                if (++frameCounter % 10 == 0 && transformKey() != appliedTransformKey) updateTransform()
+            }
         }
 
         btnPhoto.setOnClickListener { takePhoto() }
@@ -447,7 +463,7 @@ class MainActivity : Activity() {
         btnSave.setOnClickListener { setSaveMode(true) }
         val tapViews = listOf<View>(
             btnPanel, btnMode, btnPhoto, btnStack, btnRec,
-            btnAspect, btnNr, btnEdge, btnBitrate, cbExp, cbFocus, cbFlip, cbStackSum,
+            btnAspect, btnStab, btnNr, btnEdge, btnBitrate, cbExp, cbFocus, cbFlip, cbStackSum,
             btnPause, btnGallery, btnTorch, btnSave, btnServer, btnCam
         )
         for (v in tapViews) {
@@ -492,6 +508,7 @@ class MainActivity : Activity() {
         }
         cbStackSum.setOnCheckedChangeListener { _, _ -> savePrefs() }
         btnAspect.setOnClickListener { toggleAspect() }
+        btnStab.setOnClickListener { toggleStabilization() }
         btnPanel.setOnClickListener {
             panel.visibility = if (panel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
         }
@@ -542,6 +559,7 @@ class MainActivity : Activity() {
             .putInt("edgeMode", edgeMode)
             .putInt("bitrate", bitrateIdx)
             .putInt("aspect", aspectMode)
+            .putBoolean("stab", stabOn)
             .apply()
     }
 
@@ -623,7 +641,7 @@ class MainActivity : Activity() {
     }
 
     private fun videoName(): String {
-        videoInfo = shotInfo()
+        videoInfo = shotInfo() + "; video stabilization " + (if (stabOn) "on" else "off")
         return "macro_" + stamp() + "_" + fileTag()
     }
 
@@ -714,15 +732,89 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun finishVideoFile() {
+    // размер файла по uri в байтах; -1, если файл недоступен
+    private fun mediaSize(uri: Uri): Long = try {
+        contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: -1L
+    } catch (_: Exception) {
+        -1L
+    }
+
+    // «имя, размер», если запись о файле есть в галерее (MediaStore); null, если записи нет
+    private fun describeMedia(uri: Uri): String? = try {
+        contentResolver.query(
+            uri,
+            arrayOf(MediaStore.MediaColumns.DISPLAY_NAME, MediaStore.MediaColumns.SIZE),
+            null, null, null
+        )?.use { c ->
+            if (c.moveToFirst()) {
+                val size = c.getLong(1)
+                val sz = if (size >= 1_048_576L) String.format(Locale.US, "%.1f МБ", size / 1048576.0)
+                else (size / 1024).toString() + " КБ"
+                c.getString(0) + ", " + sz
+            } else null
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+    // Файл создаётся скрытым (IS_PENDING=1) и появляется в галерее только после успешной записи
+    private fun createVideoEntry(): Uri? {
+        val values = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, videoName() + ".mp4")
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/MacroCam")
+            put(MediaStore.Video.Media.IS_PENDING, 1)
+        }
+        val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+        videoUri = uri
+        return uri
+    }
+
+    // убрать недозаписанный файл, если запись не началась
+    private fun discardVideoEntry() {
+        val u = videoUri
+        videoUri = null
+        videoInfo = null
+        if (u != null) {
+            try { contentResolver.delete(u, null, null) } catch (_: Exception) {}
+        }
+    }
+
+    // Проверяет, что файл реально записан, и пишет в лог итог: сохранено или нет и почему
+    private fun finishVideoFile(stopOk: Boolean, why: String?) {
         beep()
         val u = videoUri
         val info = videoInfo
-        if (u != null && info != null) embedMp4Comment(u, info)
-        if (u != null) rememberLast(u, "video/mp4")
         paused = false
         videoUri = null
         videoInfo = null
+        if (u == null) {
+            log("Видео НЕ сохранено: файл не был создан")
+            return
+        }
+        val size = mediaSize(u)
+        if (!stopOk || size < 2048) {
+            try { contentResolver.delete(u, null, null) } catch (_: Exception) {}
+            log("Видео НЕ сохранено: " + (why ?: "в файл не попало ни одного кадра") +
+                " (размер файла " + size + " байт)")
+            return
+        }
+        if (info != null) embedMp4Comment(u, info)
+        try {
+            val done = ContentValues()
+            done.put(MediaStore.Video.Media.IS_PENDING, 0)
+            contentResolver.update(u, done, null, null)
+        } catch (e: Exception) {
+            log("Видео записано, но не добавлено в галерею: $e")
+            return
+        }
+        val desc = describeMedia(u)
+        if (desc == null) {
+            log("Видео НЕ найдено в галерее после сохранения (запись о файле пропала)")
+        } else {
+            rememberLast(u, "video/mp4")
+            log("Видео сохранено: Movies/MacroCam/$desc")
+        }
     }
 
     // ---------- значения ползунков ----------
@@ -755,6 +847,51 @@ class MainActivity : Activity() {
     }
 
     private fun aspectLabel(): String = "Формат: " + arrayOf("4:3", "16:9", "20:9")[aspectMode]
+
+    private fun stabLabel(): String = "Стабилизация: " + (if (stabOn) "вкл" else "выкл")
+
+    // что умеет текущая камера: электронная (EIS) и оптическая (OIS) стабилизация
+    private fun hasEis(): Boolean =
+        chars?.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
+            ?.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON) == true
+
+    private fun hasOis(): Boolean =
+        chars?.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+            ?.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON) == true
+
+    private fun stabSupportText(): String =
+        "электронная " + (if (hasEis()) "есть" else "нет") + ", оптическая " + (if (hasOis()) "есть" else "нет")
+
+    private fun toggleStabilization() {
+        stabOn = !stabOn
+        btnStab.text = stabLabel()
+        savePrefs()
+        if (!hasEis() && !hasOis()) {
+            log("Стабилизация: " + (if (stabOn) "вкл" else "выкл") + ", но эта камера её не поддерживает (" + stabSupportText() + ")")
+        } else {
+            log("Стабилизация видео: " + (if (stabOn) "вкл" else "выкл") + " (" + stabSupportText() + ")")
+        }
+        updateRepeating()
+    }
+
+    // Стабилизация действует только при записи видео; фото и долгая выдержка идут как раньше
+    private fun applyStabilization(b: CaptureRequest.Builder, record: Boolean) {
+        if (!record) return
+        if (hasEis()) {
+            b.set(
+                CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                if (stabOn) CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                else CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+            )
+        }
+        if (hasOis()) {
+            b.set(
+                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                if (stabOn) CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
+                else CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF
+            )
+        }
+    }
 
     private fun updateLabels() {
         tvIso.text = "ISO: " + currentIso()
@@ -841,6 +978,7 @@ class MainActivity : Activity() {
     private fun applyControls(b: CaptureRequest.Builder, record: Boolean) {
         applyZoom(b)
         applyProcessing(b)
+        applyStabilization(b, record)
         if (cbExp.isChecked && isoRange != null && expRange != null) {
             val exp = currentExp()
             b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
@@ -966,9 +1104,31 @@ class MainActivity : Activity() {
             Surface.ROTATION_270 -> 270
             else -> 0
         }
-        // приложение всегда альбомное: после возврата из галереи система может ещё сообщать портрет
-        if (texture.width > texture.height && (deg == 0 || deg == 180)) return 90
+        // приложение всегда альбомное, но после возврата из галереи система может ещё сообщать
+        // портретный поворот. Ориентируемся на форму окна, а при неверном значении берём
+        // последний известный альбомный поворот (90 или 270), а не фиксированные 90
+        val vw = texture.width
+        val vh = texture.height
+        if (vw > vh) {
+            if (deg == 90 || deg == 270) {
+                lastLandscapeDeg = deg
+                return deg
+            }
+            return lastLandscapeDeg
+        }
+        if (vh > vw && (deg == 90 || deg == 270)) return 0
         return deg
+    }
+
+    private fun transformKey(): String =
+        texture.width.toString() + "x" + texture.height + "/" + displayDegrees() + "/" + previewSize
+
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) {}
+        override fun onDisplayRemoved(displayId: Int) {}
+        override fun onDisplayChanged(displayId: Int) {
+            updateTransform()
+        }
     }
 
     // Поворот для файлов (видео и фото) с учётом ориентации экрана и переворота 180°
@@ -989,6 +1149,11 @@ class MainActivity : Activity() {
                 val cy = vh / 2f
                 val m = Matrix()
                 val deg = displayDegrees()
+                val key = transformKey()
+                if (key != appliedTransformKey) {
+                    appliedTransformKey = key
+                    log("Превью: вид " + vw.toInt() + "x" + vh.toInt() + ", поворот " + deg + "°")
+                }
                 if (deg == 90 || deg == 270) {
                     // TextureView показывает кадр как в портрете: снимаем растяжение,
                     // вписываем в экран и поворачиваем в альбомную ориентацию
@@ -1466,6 +1631,7 @@ class MainActivity : Activity() {
         b("flip", cbFlip.isChecked)
         b("stackSum", cbStackSum.isChecked)
         s("aspect", btnAspect.text.toString())
+        s("stab", btnStab.text.toString())
         s("nr", btnNr.text.toString())
         s("edge", btnEdge.text.toString())
         s("bitrate", btnBitrate.text.toString())
@@ -1493,6 +1659,7 @@ class MainActivity : Activity() {
                             "pause" -> btnPause.performClick()
                             "stack" -> btnStack.performClick()
                             "aspect" -> btnAspect.performClick()
+                            "stab" -> btnStab.performClick()
                             "nr" -> btnNr.performClick()
                             "edge" -> btnEdge.performClick()
                             "bitrate" -> btnBitrate.performClick()
@@ -1541,21 +1708,83 @@ class MainActivity : Activity() {
         prefs.edit().putString("lastUri", uri.toString()).putString("lastMime", mime).apply()
     }
 
+    // Файл можно открыть, только если он ещё есть и приложение имеет к нему доступ
+    private fun mediaAccessible(u: Uri): Boolean = mediaSize(u) > 0
+
+    // Самый новый файл из Movies/MacroCam и Pictures/MacroCam, к которому есть доступ
+    private fun newestOwnMedia(): Pair<Uri, String>? {
+        var best: Pair<Uri, String>? = null
+        var bestDate = -1L
+        val sources = listOf(
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI to "video/mp4",
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI to "image/jpeg"
+        )
+        for ((base, mime) in sources) {
+            try {
+                contentResolver.query(
+                    base,
+                    arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DATE_ADDED),
+                    MediaStore.MediaColumns.RELATIVE_PATH + " LIKE ?",
+                    arrayOf("%MacroCam%"),
+                    MediaStore.MediaColumns.DATE_ADDED + " DESC"
+                )?.use { c ->
+                    var tries = 0
+                    while (c.moveToNext() && tries < 5) {
+                        tries++
+                        val uri = android.content.ContentUris.withAppendedId(base, c.getLong(0))
+                        if (mediaAccessible(uri)) {
+                            val d = c.getLong(1)
+                            if (d > bestDate) { bestDate = d; best = Pair(uri, mime) }
+                            break
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                log("Поиск последнего файла: $e")
+            }
+        }
+        return best
+    }
+
+    // Запасной вариант: просто открыть приложение «Галерея»
+    private fun openGalleryApp() {
+        try {
+            startActivity(Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_GALLERY))
+        } catch (e: Exception) {
+            try {
+                val i = Intent(Intent.ACTION_VIEW)
+                i.setDataAndType(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, "image/*")
+                startActivity(i)
+            } catch (e2: Exception) {
+                log("Галерея не открылась: $e2")
+            }
+        }
+    }
+
     private fun openGallery() {
         if (recording || stacking) { log("Сначала остановите запись или долгую выдержку"); return }
-        val u = lastMediaUri ?: prefs.getString("lastUri", null)?.let { Uri.parse(it) }
-        val mime = lastMediaMime ?: prefs.getString("lastMime", null)
+        var u = lastMediaUri ?: prefs.getString("lastUri", null)?.let { Uri.parse(it) }
+        var mime = lastMediaMime ?: prefs.getString("lastMime", null)
+        if (u != null && !mediaAccessible(u)) {
+            // файл удалён или принадлежит прежней установке приложения: открытие дало бы SecurityException
+            log("Последний файл недоступен (удалён или нет прав), ищу другой")
+            lastMediaUri = null
+            lastMediaMime = null
+            prefs.edit().remove("lastUri").remove("lastMime").apply()
+            val alt = newestOwnMedia()
+            u = alt?.first
+            mime = alt?.second
+            if (u == null) log("Своих файлов в галерее не найдено, открываю саму галерею")
+        }
+        if (u == null) { openGalleryApp(); return }
         try {
-            if (u != null) {
-                val i = Intent(Intent.ACTION_VIEW)
-                i.setDataAndType(u, mime ?: "*/*")
-                i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                startActivity(i)
-            } else {
-                startActivity(Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_GALLERY))
-            }
+            val i = Intent(Intent.ACTION_VIEW)
+            i.setDataAndType(u, mime ?: "*/*")
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(i)
         } catch (e: Exception) {
-            log("Не удалось открыть галерею: $e")
+            log("Не удалось открыть файл в галерее: $e")
+            openGalleryApp()
         }
     }
 
@@ -1810,16 +2039,23 @@ class MainActivity : Activity() {
         distM: Double? = null,
         tag: String? = null
     ) {
+        var created: Uri? = null
         try {
             val name = "macro_" + stamp() + (if (tag != null) "_$tag" else "")
             val values = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, "$name.jpg")
                 put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
                 put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/MacroCam")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
             }
             val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
             if (uri == null) { log("Не удалось создать файл фото"); return }
-            contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+            created = uri
+            val os = contentResolver.openOutputStream(uri)
+            if (os == null) throw java.io.IOException("не удалось открыть файл для записи")
+            os.use { it.write(bytes) }
+            // ошибка записи метаданных не должна терять сам снимок
+            try {
             if (rotation >= 0 || info != null) {
                 val rw = contentResolver.openFileDescriptor(uri, "rw")
                 if (rw != null) {
@@ -1851,10 +2087,25 @@ class MainActivity : Activity() {
                     }
                 }
             }
-            rememberLast(uri, "image/jpeg")
-            log("Фото сохранено: Pictures/MacroCam")
+            } catch (e: Exception) {
+                log("Фото: метаданные не записаны: $e")
+            }
+            val done = ContentValues()
+            done.put(MediaStore.Images.Media.IS_PENDING, 0)
+            contentResolver.update(uri, done, null, null)
+            val desc = describeMedia(uri)
+            if (desc == null) {
+                log("Фото НЕ найдено в галерее после сохранения (запись о файле пропала)")
+            } else {
+                rememberLast(uri, "image/jpeg")
+                log("Фото сохранено: Pictures/MacroCam/$desc")
+            }
         } catch (e: Exception) {
-            log("Ошибка сохранения фото: $e")
+            log("Фото НЕ сохранено: $e")
+            val c = created
+            if (c != null) {
+                try { contentResolver.delete(c, null, null) } catch (_: Exception) {}
+            }
         }
     }
 
@@ -2160,16 +2411,10 @@ class MainActivity : Activity() {
         val pv = previewSurface
         if (cam == null || sess == null || ps == null || pv == null) { startRecordingLegacy(); return }
         try {
-            val values = ContentValues().apply {
-                put(MediaStore.Video.Media.DISPLAY_NAME, videoName() + ".mp4")
-                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/MacroCam")
-            }
-            val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-            if (uri == null) { log("Не удалось создать файл видео"); return }
-            videoUri = uri
+            val uri = createVideoEntry()
+            if (uri == null) { log("Не удалось создать файл видео в галерее"); return }
             val fd = contentResolver.openFileDescriptor(uri, "w")
-            if (fd == null) { log("Не удалось открыть файл видео"); return }
+            if (fd == null) { log("Не удалось открыть файл видео"); discardVideoEntry(); return }
             pfd = fd
 
             val fixed = bitrates[bitrateIdx]
@@ -2177,6 +2422,8 @@ class MainActivity : Activity() {
             else (videoSize.width.toLong() * videoSize.height * 30 * 0.15).toLong()
                 .coerceIn(8_000_000L, 50_000_000L).toInt()
             val r = MediaRecorder()
+            r.setOnErrorListener { _, what, extra -> log("Ошибка рекордера: what=$what extra=$extra") }
+            r.setOnInfoListener { _, what, extra -> log("Рекордер: info what=$what extra=$extra") }
             val withAudio = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
             if (withAudio) r.setAudioSource(MediaRecorder.AudioSource.MIC) else log("Нет разрешения на микрофон, запись без звука")
             r.setVideoSource(MediaRecorder.VideoSource.SURFACE)
@@ -2207,10 +2454,12 @@ class MainActivity : Activity() {
             recordingPersistent = true
             btnRec.text = "Стоп"
             updatePauseUi()
-            log("ЗАПИСЬ ИДЁТ: " + videoSize.width + "x" + videoSize.height + ", " + (br / 1_000_000) + " Мбит/с")
+            log("ЗАПИСЬ ИДЁТ: " + videoSize.width + "x" + videoSize.height + ", " + (br / 1_000_000) +
+                " Мбит/с, стабилизация " + (if (stabOn) "вкл" else "выкл") + " (" + stabSupportText() + ")")
         } catch (e: Exception) {
             log("Ошибка записи: $e")
             cleanupRecorder()
+            discardVideoEntry()
             recording = false
             recordingPersistent = false
             btnRec.text = "Видео"
@@ -2220,15 +2469,27 @@ class MainActivity : Activity() {
     }
 
     private fun stopRecordingPersistent() {
-        restorePreview()
-        try { recorder?.stop() } catch (e: Exception) { log("stop: $e") }
-        cleanupRecorder()
-        finishVideoFile()
-        recording = false
-        recordingPersistent = false
-        btnRec.text = "Видео"
-        updatePauseUi()
-        log("Видео сохранено: Movies/MacroCam")
+        var ok = true
+        var why: String? = null
+        try {
+            restorePreview()
+            try {
+                recorder?.stop()
+            } catch (e: Exception) {
+                ok = false
+                why = "рекордер не смог завершить файл: $e"
+            }
+            cleanupRecorder()
+            finishVideoFile(ok, why)
+        } catch (e: Throwable) {
+            log("Видео: ошибка при завершении записи: $e")
+            discardVideoEntry()
+        } finally {
+            recording = false
+            recordingPersistent = false
+            btnRec.text = "Видео"
+            updatePauseUi()
+        }
     }
 
     private fun startRecordingLegacy() {
@@ -2236,16 +2497,10 @@ class MainActivity : Activity() {
         if (cam == null) { log("Сначала откройте камеру"); return }
         if (stacking) { log("Идёт долгая выдержка"); return }
         try {
-            val values = ContentValues().apply {
-                put(MediaStore.Video.Media.DISPLAY_NAME, videoName() + ".mp4")
-                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/MacroCam")
-            }
-            val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-            if (uri == null) { log("Не удалось создать файл видео"); return }
-            videoUri = uri
+            val uri = createVideoEntry()
+            if (uri == null) { log("Не удалось создать файл видео в галерее"); return }
             val fd = contentResolver.openFileDescriptor(uri, "w")
-            if (fd == null) { log("Не удалось открыть файл видео"); return }
+            if (fd == null) { log("Не удалось открыть файл видео"); discardVideoEntry(); return }
             pfd = fd
 
             val cands = if (videoCandidates.isEmpty()) listOf(videoSize) else videoCandidates.take(4)
@@ -2286,8 +2541,11 @@ class MainActivity : Activity() {
             val rec: MediaRecorder = made ?: run {
                 log("Не удалось подготовить запись")
                 cleanupRecorder()
+                discardVideoEntry()
                 return
             }
+            rec.setOnErrorListener { _, what, extra -> log("Ошибка рекордера: what=$what extra=$extra") }
+            rec.setOnInfoListener { _, what, extra -> log("Рекордер: info what=$what extra=$extra") }
             recorder = rec
 
             val st = texture.surfaceTexture!!
@@ -2312,34 +2570,51 @@ class MainActivity : Activity() {
                         recording = true
                         runOnUiThread { btnRec.text = "Стоп" }
                         updatePauseUi()
-                        log("ЗАПИСЬ ИДЁТ")
+                        log("ЗАПИСЬ ИДЁТ, стабилизация " + (if (stabOn) "вкл" else "выкл") + " (" + stabSupportText() + ")")
                     } catch (e: Exception) {
                         log("Ошибка старта записи: $e")
                         cleanupRecorder()
+                        discardVideoEntry()
+                        startPreview()
                     }
                 }
                 override fun onConfigureFailed(s: CameraCaptureSession) {
                     log("Сессия записи не настроилась")
                     cleanupRecorder()
+                    discardVideoEntry()
+                    startPreview()
                 }
             }, handler)
         } catch (e: Exception) {
             log("Ошибка записи: $e")
             cleanupRecorder()
+            discardVideoEntry()
         }
     }
 
     private fun stopRecording() {
         if (recordingPersistent) { stopRecordingPersistent(); return }
-        try { session?.stopRepeating() } catch (_: Exception) {}
-        try { session?.abortCaptures() } catch (_: Exception) {}
-        try { recorder?.stop() } catch (e: Exception) { log("stop: $e") }
-        cleanupRecorder()
-        finishVideoFile()
-        recording = false
-        btnRec.text = "Видео"
-        updatePauseUi()
-        log("Видео сохранено: Movies/MacroCam")
+        var ok = true
+        var why: String? = null
+        try {
+            try { session?.stopRepeating() } catch (_: Exception) {}
+            try { session?.abortCaptures() } catch (_: Exception) {}
+            try {
+                recorder?.stop()
+            } catch (e: Exception) {
+                ok = false
+                why = "рекордер не смог завершить файл: $e"
+            }
+            cleanupRecorder()
+            finishVideoFile(ok, why)
+        } catch (e: Throwable) {
+            log("Видео: ошибка при завершении записи: $e")
+            discardVideoEntry()
+        } finally {
+            recording = false
+            btnRec.text = "Видео"
+            updatePauseUi()
+        }
         startPreview()
     }
 
@@ -2374,16 +2649,33 @@ class MainActivity : Activity() {
         tryAutoOpen()
     }
 
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        hideSystemUi()
+        updateTransform()
+        texture.post { updateTransform() }
+        texture.postDelayed({ updateTransform() }, 300)
+    }
+
     override fun onResume() {
         super.onResume()
         hideSystemUi()
+        try {
+            (getSystemService(DISPLAY_SERVICE) as DisplayManager)
+                .registerDisplayListener(displayListener, Handler(Looper.getMainLooper()))
+        } catch (_: Exception) {}
+        appliedTransformKey = ""
         updateTransform()
+        texture.post { updateTransform() }
         texture.postDelayed({ updateTransform() }, 300)
         texture.postDelayed({ updateTransform() }, 900)
         tryAutoOpen()
     }
 
     override fun onPause() {
+        try {
+            (getSystemService(DISPLAY_SERVICE) as DisplayManager).unregisterDisplayListener(displayListener)
+        } catch (_: Exception) {}
         savePrefs()
         if (saveMode) setSaveMode(false)
         if (stacking) {
@@ -2442,6 +2734,7 @@ label{display:block;margin:8px 0 2px}
 <label id="lStack">Долгая выдержка</label><input type="range" id="sStack" min="0" max="118">
 <label><input type="checkbox" id="cFlip"> Перевернуть 180°</label>
 <button id="bAspect">Формат</button>
+<button id="bStab">Стабилизация</button>
 <button id="bNr">Шумоподавление</button>
 <button id="bEdge">Контуры</button>
 <button id="bBit">Битрейт</button>
@@ -2496,6 +2789,7 @@ function poll(){
     G('cExp').checked = s.manExp; G('cFocus').checked = s.manFocus;
     G('cFlip').checked = s.flip;
     G('bAspect').textContent = s.aspect;
+    G('bStab').textContent = s.stab;
     G('bNr').textContent = s.nr;
     G('bEdge').textContent = s.edge;
     G('bBit').textContent = s.bitrate;
@@ -2510,7 +2804,7 @@ slider('sZoom', 'zoom'); slider('sIso', 'iso'); slider('sExp', 'exp');
 slider('sFocus', 'focus'); slider('sBoost', 'boost'); slider('sStack', 'stack');
 check('cExp', 'manExp'); check('cFocus', 'manFocus'); check('cFlip', 'flip'); 
 bindClick('bPhoto', 'photo'); bindClick('bStack', 'stack');
-bindClick('bRec', 'rec'); bindClick('bPause', 'pause'); bindClick('bAspect', 'aspect');
+bindClick('bRec', 'rec'); bindClick('bPause', 'pause'); bindClick('bAspect', 'aspect'); bindClick('bStab', 'stab');
 bindClick('bNr', 'nr'); bindClick('bEdge', 'edge'); bindClick('bBit', 'bitrate'); bindClick('bTorch', 'torch'); bindClick('bCam', 'cam');
 
 G('v').addEventListener('click', function(e){
