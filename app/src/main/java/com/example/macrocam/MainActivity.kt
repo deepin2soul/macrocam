@@ -177,6 +177,22 @@ class MainActivity : Activity() {
     private var lastLandscapeDeg = 90
     private var appliedTransformKey = ""
     private var frameCounter = 0
+    // размер вида, с которым запущено превью; камера стартует только после стабилизации размера
+    private var startedViewW = 0
+    private var startedViewH = 0
+    private var reopenPending = false
+    private val restartRunnable = Runnable {
+        reopenPending = false
+        if (!recording && !stacking && !opening) {
+            log("Перезапуск камеры (экран " + texture.width + "x" + texture.height + ")")
+            if (device != null) openById(cameraId) else tryAutoOpen()
+        }
+    }
+    private fun scheduleRestart(delayMs: Long) {
+        reopenPending = true
+        texture.removeCallbacks(restartRunnable)
+        texture.postDelayed(restartRunnable, delayMs)
+    }
     private val bitrates = intArrayOf(0, 20, 40, 80)
     private var bitrateIdx = 0
     private lateinit var sbStack: SeekBar
@@ -419,10 +435,15 @@ class MainActivity : Activity() {
         texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
                 updateTransform()
-                tryAutoOpen()
+                if (!reopenPending) tryAutoOpen()
             }
             override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {
                 updateTransform()
+                // размер экрана изменился уже после запуска камеры (так бывает при возврате из галереи):
+                // перезапускаем камеру, когда размер устоится
+                if (device != null && !recording && !stacking && startedViewW > 0 &&
+                    (w != startedViewW || h != startedViewH)
+                ) scheduleRestart(600)
             }
             override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean = true
             override fun onSurfaceTextureUpdated(st: SurfaceTexture) {
@@ -872,12 +893,15 @@ class MainActivity : Activity() {
         } else {
             log("Стабилизация видео: " + (if (stabOn) "вкл" else "выкл") + " (" + stabSupportText() + ")")
         }
+        if (stabOn && cbExp.isChecked) {
+            log("Внимание: при включённых «Ручные ISO и выдержка» кадров мало и стабилизация почти не работает")
+        }
         updateRepeating()
     }
 
-    // Стабилизация действует только при записи видео; фото и долгая выдержка идут как раньше
-    private fun applyStabilization(b: CaptureRequest.Builder, record: Boolean) {
-        if (!record) return
+    // Стабилизация действует в превью и при записи видео, чтобы эффект был виден сразу;
+    // фото и долгая выдержка (stab=false) идут как раньше
+    private fun applyStabilization(b: CaptureRequest.Builder) {
         if (hasEis()) {
             b.set(
                 CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
@@ -976,10 +1000,10 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun applyControls(b: CaptureRequest.Builder, record: Boolean) {
+    private fun applyControls(b: CaptureRequest.Builder, record: Boolean, stab: Boolean = true) {
         applyZoom(b)
         applyProcessing(b)
-        applyStabilization(b, record)
+        if (stab) applyStabilization(b)
         if (cbExp.isChecked && isoRange != null && expRange != null) {
             val exp = currentExp()
             b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
@@ -1010,7 +1034,7 @@ class MainActivity : Activity() {
         val b = builder ?: return
         val s = session ?: return
         try {
-            applyControls(b, recording)
+            applyControls(b, recording, !stacking)
             s.setRepeatingRequest(b.build(), null, handler)
         } catch (e: Exception) {
             log("Ошибка обновления: $e")
@@ -1956,6 +1980,8 @@ class MainActivity : Activity() {
             st.setDefaultBufferSize(previewSize.width, previewSize.height)
             val surface = Surface(st)
             previewSurface = surface
+            startedViewW = texture.width
+            startedViewH = texture.height
             focusOverride = if (cbFocus.isChecked && minFocus > 0f) 0f else null
             val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             b.addTarget(surface)
@@ -2195,7 +2221,7 @@ class MainActivity : Activity() {
             focusOverride = if (cbFocus.isChecked && minFocus > 0f) 0f else null
             val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             b.addTarget(pSurface)
-            applyControls(b, false)
+            applyControls(b, false, false)
             builder = b
             cam.createCaptureSession(listOf(pSurface, reader.surface), object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
@@ -2254,7 +2280,7 @@ class MainActivity : Activity() {
         try {
             val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             b.addTarget(reader.surface)
-            applyControls(b, false)
+            applyControls(b, false, false)
             if (Build.VERSION.SDK_INT >= 30) b.set(CaptureRequest.CONTROL_ENABLE_ZSL, false)
             s.capture(b.build(), stackCb, handler)
             stackSubmitted++
@@ -2696,10 +2722,20 @@ class MainActivity : Activity() {
         texture.post { updateTransform() }
         texture.postDelayed({ updateTransform() }, 300)
         texture.postDelayed({ updateTransform() }, 900)
-        tryAutoOpen()
+        // после галереи не открываем камеру сразу: ждём, пока окно примет свой размер и поворот
+        if (cameraWasOpenOnPause) {
+            cameraWasOpenOnPause = false
+            scheduleRestart(700)
+        } else {
+            tryAutoOpen()
+        }
     }
 
+    private var cameraWasOpenOnPause = false
+
     override fun onPause() {
+        cameraWasOpenOnPause = device != null || opening
+        texture.removeCallbacks(restartRunnable)
         try {
             (getSystemService(DISPLAY_SERVICE) as DisplayManager).unregisterDisplayListener(displayListener)
         } catch (_: Exception) {}
