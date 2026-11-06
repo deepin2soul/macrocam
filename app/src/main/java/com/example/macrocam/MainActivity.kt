@@ -885,8 +885,14 @@ class MainActivity : Activity() {
         "электронная " + (if (hasEis()) "есть" else "нет") + ", оптическая " + (if (hasOis()) "есть" else "нет")
 
     private fun toggleStabilization() {
+        if (recording || stacking) { log("Сначала остановите запись или долгую выдержку"); return }
         stabOn = !stabOn
         btnStab.text = stabLabel()
+        // стабилизация работает в 16:9 и не выше 1920x1080: переключаем формат
+        if (stabOn && aspectMode != 1) {
+            aspectMode = 1
+            btnAspect.text = aspectLabel()
+        }
         savePrefs()
         if (!hasEis() && !hasOis()) {
             log("Стабилизация: " + (if (stabOn) "вкл" else "выкл") + ", но эта камера её не поддерживает (" + stabSupportText() + ")")
@@ -896,7 +902,16 @@ class MainActivity : Activity() {
         if (stabOn && cbExp.isChecked) {
             log("Внимание: при включённых «Ручные ISO и выдержка» кадров мало и стабилизация почти не работает")
         }
-        updateRepeating()
+        // перезапускаем камеру, чтобы превью и видео перешли на нужный размер
+        usePersistent = true
+        if (device != null) {
+            try { session?.close() } catch (_: Exception) {}
+            session = null
+            computeSizes()
+            startPreview()
+        } else {
+            computeSizes()
+        }
     }
 
     // Стабилизация действует в превью и при записи видео, чтобы эффект был виден сразу;
@@ -1126,14 +1141,17 @@ class MainActivity : Activity() {
 
     private fun computeSizes() {
         val map = streamMap ?: return
-        previewSize = sizesFor(map.getOutputSizes(SurfaceTexture::class.java), 13_000_000).firstOrNull() ?: previewSize
+        // со стабилизацией (16:9) превью и видео ограничены 1920x1080
+        val stab1080 = stabOn && aspectMode == 1
+        previewSize = sizesFor(map.getOutputSizes(SurfaceTexture::class.java), if (stab1080) 1920 * 1080 else 13_000_000).firstOrNull() ?: previewSize
         // видео: не больше 4K (8,3 Мпикс), только размеры, которые тянет кодер, и не помеченные как сбойные
-        val vids = sizesFor(map.getOutputSizes(MediaRecorder::class.java), 3840 * 2160)
+        val vids = sizesFor(map.getOutputSizes(MediaRecorder::class.java), if (stab1080) 1920 * 1080 else 3840 * 2160)
             .filter { !badVideoSizes.contains(it.toString()) && encoderSupports(it.width, it.height) }
         videoCandidates = vids
         videoSize = videoCandidates.firstOrNull() ?: videoSize
         photoSize = sizesFor(map.getOutputSizes(ImageFormat.YUV_420_888), 13_000_000).firstOrNull() ?: photoSize
-        log(aspectLabel() + ": превью $previewSize, видео $videoSize, фото $photoSize")
+        log(aspectLabel() + ": превью $previewSize, видео $videoSize, фото $photoSize" +
+            (if (stab1080) " (режим стабилизации 1920x1080)" else if (stabOn) " (стабилизация вкл, но она рассчитана на 16:9 1920x1080)" else ""))
         updateTransform()
     }
 
