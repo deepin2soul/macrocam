@@ -20,6 +20,8 @@ import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.hardware.display.DisplayManager
 import android.hardware.camera2.*
+import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.SessionConfiguration
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.CamcorderProfile
 import android.media.AudioAttributes
@@ -1084,12 +1086,52 @@ class MainActivity : Activity() {
         }
     }
 
+    // ответ камеры: какую стабилизацию она реально применила (пишем в лог при изменении)
+    private var lastStabResult = ""
+    private val capCb = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult
+        ) {
+            val asked = request.get(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE)
+            val eis = result.get(CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE)
+            val ois = result.get(CaptureResult.LENS_OPTICAL_STABILIZATION_MODE)
+            val key = "$asked/$eis/$ois"
+            if (key != lastStabResult) {
+                lastStabResult = key
+                log("Ответ камеры: стабилизация запрошена=$asked, применена=$eis, OIS=$ois, кадр=" +
+                    result.get(CaptureResult.SCALER_CROP_REGION))
+            }
+        }
+    }
+
+    // сессия с параметрами (стабилизация передаётся камере при создании сессии, как требуют многие телефоны)
+    private fun createSessionWithParams(
+        cam: CameraDevice, targets: List<Surface>, params: CaptureRequest?, cb: CameraCaptureSession.StateCallback
+    ) {
+        lastStabResult = ""
+        if (Build.VERSION.SDK_INT >= 28 && params != null) {
+            try {
+                val outs = targets.map { OutputConfiguration(it) }
+                val cfg = SessionConfiguration(
+                    SessionConfiguration.SESSION_REGULAR, outs, { r -> handler.post(r) }, cb
+                )
+                cfg.sessionParameters = params
+                cam.createCaptureSession(cfg)
+                log("Сессия создана с параметрами (стабилизация: " + (if (stabOn) "вкл" else "выкл") + ")")
+                return
+            } catch (e: Exception) {
+                log("Сессия с параметрами не создалась ($e), создаю обычную")
+            }
+        }
+        cam.createCaptureSession(targets, cb, handler)
+    }
+
     private fun updateRepeating() {
         val b = builder ?: return
         val s = session ?: return
         try {
             applyControls(b, recording, !stacking)
-            s.setRepeatingRequest(b.build(), null, handler)
+            s.setRepeatingRequest(b.build(), capCb, handler)
         } catch (e: Exception) {
             log("Ошибка обновления: $e")
         }
@@ -1250,7 +1292,7 @@ class MainActivity : Activity() {
                 val key = transformKey()
                 if (key != appliedTransformKey) {
                     appliedTransformKey = key
-                    log("Превью: вид " + vw.toInt() + "x" + vh.toInt() + ", поворот " + deg + "°")
+                    log("Экран: " + vw.toInt() + "x" + vh.toInt() + ", поворот экрана " + deg + "°")
                 }
                 if (deg == 90 || deg == 270) {
                     // TextureView показывает кадр как в портрете: снимаем растяжение,
@@ -2051,12 +2093,12 @@ class MainActivity : Activity() {
             if (usePersistent) ps = createPersistentSurface()
             if (ps != null) targets.add(ps)
             val hasRec = ps != null
-            cam.createCaptureSession(targets, object : CameraCaptureSession.StateCallback() {
+            createSessionWithParams(cam, targets, b.build(), object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     session = s
                     sessionHasRecorder = hasRec
                     try {
-                        s.setRepeatingRequest(b.build(), null, handler)
+                        s.setRepeatingRequest(b.build(), capCb, handler)
                         log("Камера: превью запущено")
                     } catch (e: Exception) {
                         log("Ошибка запроса: $e")
@@ -2074,7 +2116,7 @@ class MainActivity : Activity() {
                         log("Сессия не настроилась")
                     }
                 }
-            }, handler)
+            })
         } catch (e: Exception) {
             log("Ошибка превью: $e")
         }
@@ -2498,7 +2540,7 @@ class MainActivity : Activity() {
         builder = pb
         try {
             applyControls(pb, false)
-            sess.setRepeatingRequest(pb.build(), null, handler)
+            sess.setRepeatingRequest(pb.build(), capCb, handler)
         } catch (e: Exception) {
             log("Ошибка возврата превью: $e")
         }
@@ -2548,7 +2590,7 @@ class MainActivity : Activity() {
             rb.addTarget(ps)
             applyControls(rb, true)
             builder = rb
-            sess.setRepeatingRequest(rb.build(), null, handler)
+            sess.setRepeatingRequest(rb.build(), capCb, handler)
             r.start()
             recording = true
             recordingPersistent = true
@@ -2671,11 +2713,11 @@ class MainActivity : Activity() {
             try { session?.close() } catch (_: Exception) {}
             session = null
             sessionHasRecorder = false
-            cam.createCaptureSession(listOf(pSurface, rSurface), object : CameraCaptureSession.StateCallback() {
+            createSessionWithParams(cam, listOf(pSurface, rSurface), b.build(), object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     session = s
                     try {
-                        s.setRepeatingRequest(b.build(), null, handler)
+                        s.setRepeatingRequest(b.build(), capCb, handler)
                         rec.start()
                         recording = true
                         runOnUiThread { btnRec.text = "Стоп" }
@@ -2694,7 +2736,7 @@ class MainActivity : Activity() {
                     discardVideoEntry()
                     startPreview()
                 }
-            }, handler)
+            })
         } catch (e: Exception) {
             log("Ошибка записи: $e")
             cleanupRecorder()
