@@ -485,17 +485,7 @@ class MainActivity : Activity() {
                 }
             }
             override fun onStartTrackingTouch(s: SeekBar?) {}
-            override fun onStopTrackingTouch(s: SeekBar?) {
-                val name = when (s) {
-                    sbIso -> "ISO"
-                    sbExp -> "Выдержка"
-                    sbFocus -> "Фокус"
-                    sbZoom -> "Зум"
-                    sbStack -> "Долгая выдержка"
-                    else -> "ползунок"
-                }
-                log("Ползунок «" + name + "» = " + s?.progress)
-            }
+            override fun onStopTrackingTouch(s: SeekBar?) {}
         }
         sbIso.setOnSeekBarChangeListener(seekListener)
         sbExp.setOnSeekBarChangeListener(seekListener)
@@ -519,7 +509,6 @@ class MainActivity : Activity() {
         for (v in tapViews) {
             v.setOnTouchListener { vv, ev ->
                 if (ev.action == MotionEvent.ACTION_DOWN) {
-                    log("Нажато: " + describeTap(vv))
                     vv.performHapticFeedback(
                         HapticFeedbackConstants.KEYBOARD_TAP,
                         HapticFeedbackConstants.FLAG_IGNORE_GLOBAL_SETTING
@@ -583,7 +572,8 @@ class MainActivity : Activity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         torchCb = object : CameraManager.TorchCallback() {
             override fun onTorchModeChanged(cameraId: String, enabled: Boolean) {
-                if (cameraId == torchId) {
+                // пока камера открыта, фонарик управляется через сессию камеры, а не системой
+                if (cameraId == torchId && device == null) {
                     torchOn = enabled
                     runOnUiThread { btnTorch.text = if (enabled) "Фонарик: вкл" else "Фонарик: выкл" }
                 }
@@ -612,11 +602,6 @@ class MainActivity : Activity() {
             .putInt("res", resIdx)
             .putInt("aspect", aspectMode)
             .apply()
-    }
-
-    private fun describeTap(v: View): String {
-        val name = (v as? TextView)?.text?.toString() ?: v.javaClass.simpleName
-        return if (v is CheckBox) "«" + name + "» (было: " + (if (v.isChecked) "вкл" else "выкл") + ")" else "«" + name + "»"
     }
 
     private fun log(s: String) {
@@ -1038,6 +1023,9 @@ class MainActivity : Activity() {
         } else {
             b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
         }
+        if (torchOn) {
+            b.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_TORCH)
+        }
         if (cbFocus.isChecked) {
             b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
             b.set(CaptureRequest.LENS_FOCUS_DISTANCE, focusOverride ?: currentFocus())
@@ -1051,32 +1039,10 @@ class MainActivity : Activity() {
         }
     }
 
-    // ответ камеры: какую стабилизацию она реально применила (пишем в лог при изменении)
-    private var lastStabResult = ""
-    private val capCb = object : CameraCaptureSession.CaptureCallback() {
-        override fun onCaptureCompleted(
-            session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult
-        ) {
-            val asked = request.get(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE)
-            val eis = result.get(CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE)
-            val ois = result.get(CaptureResult.LENS_OPTICAL_STABILIZATION_MODE)
-            val fps = request.get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE)
-            val key = "$asked/$eis/$ois/$fps"
-            if (key != lastStabResult) {
-                lastStabResult = key
-                val dur = result.get(CaptureResult.SENSOR_FRAME_DURATION)
-                log("Ответ камеры: стабилизация запрошена=$asked, применена=$eis, OIS=$ois, FPS запрошено=$fps, " +
-                    "длительность кадра=" + (if (dur != null) (dur / 1000000L).toString() + " мс" else "?") +
-                    ", кадр=" + result.get(CaptureResult.SCALER_CROP_REGION))
-            }
-        }
-    }
-
     // сессия с параметрами (стабилизация передаётся камере при создании сессии, как требуют многие телефоны)
     private fun createSessionWithParams(
         cam: CameraDevice, targets: List<Surface>, params: CaptureRequest?, cb: CameraCaptureSession.StateCallback
     ) {
-        lastStabResult = ""
         if (Build.VERSION.SDK_INT >= 28 && params != null) {
             try {
                 val outs = targets.map { OutputConfiguration(it) }
@@ -1085,7 +1051,6 @@ class MainActivity : Activity() {
                 )
                 cfg.sessionParameters = params
                 cam.createCaptureSession(cfg)
-                log("Сессия создана")
                 return
             } catch (e: Exception) {
                 log("Сессия с параметрами не создалась ($e), создаю обычную")
@@ -1099,7 +1064,7 @@ class MainActivity : Activity() {
         val s = session ?: return
         try {
             applyControls(b, recording, !stacking)
-            s.setRepeatingRequest(b.build(), capCb, handler)
+            s.setRepeatingRequest(b.build(), null, handler)
         } catch (e: Exception) {
             log("Ошибка обновления: $e")
         }
@@ -1961,6 +1926,17 @@ class MainActivity : Activity() {
     }
 
     private fun toggleTorch() {
+        if (device != null) {
+            // камера открыта: система не даёт включить фонарик отдельно (CAMERA_IN_USE),
+            // поэтому включаем его запросом самой камеры
+            torchOn = !torchOn
+            btnTorch.text = if (torchOn) "Фонарик: вкл" else "Фонарик: выкл"
+            if (torchOn && chars?.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) != true) {
+                log("Эта камера сообщает, что у неё нет вспышки, фонарик может не загореться (попробуйте основную камеру)")
+            }
+            updateRepeating()
+            return
+        }
         var id = torchId
         if (id == null) {
             id = findTorchId()
@@ -2099,12 +2075,11 @@ class MainActivity : Activity() {
                     session = s
                     sessionHasRecorder = hasRec
                     try {
-                        s.setRepeatingRequest(b.build(), capCb, handler)
-                        log("Камера: превью запущено")
+                        s.setRepeatingRequest(b.build(), null, handler)
                     } catch (e: Exception) {
                         log("Ошибка запроса: $e")
                     }
-                    startFocusRamp { log("Линза на месте, можно снимать") }
+                    startFocusRamp { }
                 }
                 override fun onConfigureFailed(s: CameraCaptureSession) {
                     if (hasRec) {
@@ -2541,7 +2516,7 @@ class MainActivity : Activity() {
         builder = pb
         try {
             applyControls(pb, false)
-            sess.setRepeatingRequest(pb.build(), capCb, handler)
+            sess.setRepeatingRequest(pb.build(), null, handler)
         } catch (e: Exception) {
             log("Ошибка возврата превью: $e")
         }
@@ -2591,7 +2566,7 @@ class MainActivity : Activity() {
             rb.addTarget(ps)
             applyControls(rb, true)
             builder = rb
-            sess.setRepeatingRequest(rb.build(), capCb, handler)
+            sess.setRepeatingRequest(rb.build(), null, handler)
             r.start()
             recording = true
             recordingPersistent = true
@@ -2718,7 +2693,7 @@ class MainActivity : Activity() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     session = s
                     try {
-                        s.setRepeatingRequest(b.build(), capCb, handler)
+                        s.setRepeatingRequest(b.build(), null, handler)
                         rec.start()
                         recording = true
                         runOnUiThread { btnRec.text = "Стоп" }
