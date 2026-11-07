@@ -114,6 +114,7 @@ class MainActivity : Activity() {
     private lateinit var btnRec: Button
     private lateinit var btnAspect: Button
     private lateinit var btnRes: Button
+    private lateinit var btnCodec: Button
     private lateinit var sbZoom: SeekBar
     private lateinit var tvZoom: TextView
     private lateinit var thread: HandlerThread
@@ -207,7 +208,9 @@ class MainActivity : Activity() {
         texture.removeCallbacks(restartRunnable)
         texture.postDelayed(restartRunnable, delayMs)
     }
-    private val bitrates = intArrayOf(20, 40)
+    private var useHevc = true // true = H.265, false = H.264
+    // два варианта битрейта (Мбит/с): H.265 экономнее при том же качестве
+    private val bitrates: IntArray get() = if (useHevc) intArrayOf(12, 25) else intArrayOf(20, 40)
     private var bitrateIdx = 0
     private var resIdx = 1 // 0 = макс, 1 = норм (1080p)
     private lateinit var sbStack: SeekBar
@@ -340,6 +343,7 @@ class MainActivity : Activity() {
         btnEdge = mkBtn("Контуры: авто")
         btnBitrate = mkBtn("Битрейт: 20 Мбит/с")
         btnRes = mkBtn("Разрешение: Норм")
+        btnCodec = mkBtn("Кодек: H.265")
 
         val col = LinearLayout(this)
         col.orientation = LinearLayout.VERTICAL
@@ -349,6 +353,7 @@ class MainActivity : Activity() {
         col.addView(btnSave)
         col.addView(btnAspect)
         col.addView(btnRes)
+        col.addView(btnCodec)
         col.addView(btnBitrate)
         col.addView(cbFlip)
         col.addView(tvZoom)
@@ -438,6 +443,8 @@ class MainActivity : Activity() {
         nrMode = prefs.getInt("nrMode", -1)
         edgeMode = prefs.getInt("edgeMode", -1)
         updateModeButtons()
+        useHevc = prefs.getBoolean("hevc", true) && hasHevcEncoder()
+        btnCodec.text = codecLabel()
         bitrateIdx = prefs.getInt("bitrate2", 0).coerceIn(0, bitrates.size - 1)
         btnBitrate.text = bitrateLabel()
         resIdx = prefs.getInt("res", 1).coerceIn(0, 1)
@@ -505,7 +512,7 @@ class MainActivity : Activity() {
         btnSave.setOnClickListener { setSaveMode(true) }
         val tapViews = listOf<View>(
             btnPanel, btnMode, btnPhoto, btnStack, btnRec,
-            btnAspect, btnRes, btnNr, btnEdge, btnBitrate, cbExp, cbFocus, cbFlip, cbStackSum,
+            btnAspect, btnRes, btnCodec, btnNr, btnEdge, btnBitrate, cbExp, cbFocus, cbFlip, cbStackSum,
             btnPause, btnGallery, btnTorch, btnSave, btnServer, btnCam
         )
         for (v in tapViews) {
@@ -551,6 +558,7 @@ class MainActivity : Activity() {
         cbStackSum.setOnCheckedChangeListener { _, _ -> savePrefs() }
         btnAspect.setOnClickListener { toggleAspect() }
         btnRes.setOnClickListener { toggleResolution() }
+        btnCodec.setOnClickListener { toggleCodec() }
         btnPanel.setOnClickListener {
             panel.visibility = if (panel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
         }
@@ -601,6 +609,7 @@ class MainActivity : Activity() {
             .putString("camId", cameraId)
             .putInt("edgeMode", edgeMode)
             .putInt("bitrate2", bitrateIdx)
+            .putBoolean("hevc", useHevc)
             .putInt("res", resIdx)
             .putInt("aspect", aspectMode)
             .apply()
@@ -886,6 +895,28 @@ class MainActivity : Activity() {
     private fun currentZoom(): Float =
         maxZoom.toDouble().pow(sbZoom.progress / 1000.0).toFloat()
 
+    private fun codecLabel(): String = "Кодек: " + (if (useHevc) "H.265" else "H.264")
+
+    private fun hasHevcEncoder(): Boolean = try {
+        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { it.isEncoder && it.supportedTypes.contains("video/hevc") }
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun videoEncoderType(): Int =
+        if (useHevc) MediaRecorder.VideoEncoder.HEVC else MediaRecorder.VideoEncoder.H264
+
+    private fun toggleCodec() {
+        if (recording || stacking) { log("Сначала остановите запись или долгую выдержку"); return }
+        if (!useHevc && !hasHevcEncoder()) { log("Кодер H.265 на этом телефоне недоступен"); return }
+        useHevc = !useHevc
+        bitrateIdx = bitrateIdx.coerceIn(0, bitrates.size - 1)
+        btnCodec.text = codecLabel()
+        btnBitrate.text = bitrateLabel()
+        savePrefs()
+        restartSession()
+    }
+
     private fun bitrateLabel(): String {
         val v = bitrates[bitrateIdx]
         return "Битрейт: $v Мбит/с"
@@ -1149,9 +1180,10 @@ class MainActivity : Activity() {
 
     // кодер H.264 должен реально поддерживать размер (иначе запись ломается уже в процессе)
     private fun encoderSupports(w: Int, h: Int): Boolean = try {
+        val mime = if (useHevc) "video/hevc" else "video/avc"
         MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { ci ->
-            ci.isEncoder && ci.supportedTypes.contains("video/avc") &&
-                ci.getCapabilitiesForType("video/avc").videoCapabilities.isSizeSupported(w, h)
+            ci.isEncoder && ci.supportedTypes.contains(mime) &&
+                ci.getCapabilitiesForType(mime).videoCapabilities.isSizeSupported(w, h)
         }
     } catch (_: Exception) {
         true
@@ -1380,6 +1412,7 @@ class MainActivity : Activity() {
         cbStackSum.visibility = vis
         btnRec.visibility = visVideo
         btnRes.visibility = if (photo || aspectMode == 2) View.GONE else View.VISIBLE
+        btnCodec.visibility = visVideo
         btnBitrate.visibility = visVideo
         updatePauseUi()
     }
@@ -2047,7 +2080,7 @@ class MainActivity : Activity() {
                 t.setVideoSource(MediaRecorder.VideoSource.SURFACE)
                 t.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
                 t.setOutputFile(tmp.absolutePath)
-                t.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+                t.setVideoEncoder(videoEncoderType())
                 t.setVideoEncodingBitRate(10_000_000)
                 t.setVideoFrameRate(30)
                 t.setVideoSize(sz.width, sz.height)
@@ -2574,7 +2607,7 @@ class MainActivity : Activity() {
                 r.setAudioEncodingBitRate(128_000)
                 r.setAudioSamplingRate(44_100)
             }
-            r.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            r.setVideoEncoder(videoEncoderType())
             r.setVideoEncodingBitRate(br)
             r.setVideoFrameRate(30)
             r.setVideoSize(videoSize.width, videoSize.height)
@@ -2595,7 +2628,7 @@ class MainActivity : Activity() {
             btnRec.text = "Стоп"
             updatePauseUi()
             log("ЗАПИСЬ ИДЁТ: " + videoSize.width + "x" + videoSize.height + ", " + (br / 1_000_000) +
-                " Мбит/с")
+                " Мбит/с, " + (if (useHevc) "H.265" else "H.264"))
         } catch (e: Exception) {
             log("Ошибка записи: $e")
             cleanupRecorder()
@@ -2668,7 +2701,7 @@ class MainActivity : Activity() {
                         t.setAudioEncodingBitRate(128_000)
                         t.setAudioSamplingRate(44_100)
                     }
-                    t.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+                    t.setVideoEncoder(videoEncoderType())
                     val fixed = bitrates[bitrateIdx]
                     val br = if (fixed > 0) fixed * 1_000_000
                     else (sz.width.toLong() * sz.height * 30 * 0.15).toLong()
@@ -2680,7 +2713,7 @@ class MainActivity : Activity() {
                     t.prepare()
                     made = t
                     videoSize = sz
-                    log("Видео: " + sz.width + "x" + sz.height + ", " + (br / 1_000_000) + " Мбит/с")
+                    log("Видео: " + sz.width + "x" + sz.height + ", " + (br / 1_000_000) + " Мбит/с, " + (if (useHevc) "H.265" else "H.264"))
                     break
                 } catch (e: Exception) {
                     log("Размер " + sz.width + "x" + sz.height + " не подошёл: " + e)
