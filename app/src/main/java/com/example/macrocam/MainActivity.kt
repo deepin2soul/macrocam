@@ -379,6 +379,7 @@ class MainActivity : Activity() {
         logView = TextView(this)
         logView.setTextColor(Color.WHITE)
         logView.textSize = 11f
+        logView.setTextIsSelectable(true) // долгое нажатие: выделить текст, «Выбрать все», «Копировать»
         logScroll = ScrollView(this)
         logScroll.setBackgroundColor(Color.argb(0x66, 0, 0, 0))
         logScroll.addView(logView)
@@ -448,6 +449,7 @@ class MainActivity : Activity() {
         sbZoom.progress = prefs.getInt("zoom", 0)
         aspectMode = prefs.getInt("aspect", 0).coerceIn(0, 2)
         btnAspect.text = aspectLabel()
+        updateModeUi()
         texture.rotation = if (cbFlip.isChecked) 180f else 0f
         texture.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> updateTransform() }
         texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
@@ -1023,9 +1025,11 @@ class MainActivity : Activity() {
         } else {
             b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
         }
-        if (torchOn) {
-            b.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_TORCH)
-        }
+        // builder переиспользуется, поэтому выключение нужно задавать явно, иначе «фонарик» остаётся в запросе
+        b.set(
+            CaptureRequest.FLASH_MODE,
+            if (torchOn) CameraMetadata.FLASH_MODE_TORCH else CameraMetadata.FLASH_MODE_OFF
+        )
         if (cbFocus.isChecked) {
             b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
             b.set(CaptureRequest.LENS_FOCUS_DISTANCE, focusOverride ?: currentFocus())
@@ -1153,14 +1157,17 @@ class MainActivity : Activity() {
         true
     }
 
+    private var lastSizesLogKey = ""
+
     private fun computeSizes() {
         val map = streamMap ?: return
         // видео: не больше 4K, только размеры, которые тянет кодер, и не помеченные как сбойные
         val vids = sizesFor(map.getOutputSizes(MediaRecorder::class.java), 3840 * 2160)
             .filter { !badVideoSizes.contains(it.toString()) && encoderSupports(it.width, it.height) }
-        // «Макс» = самый большой размер выбранного формата, «Норм» = самый большой, у которого короткая сторона не больше 1080
-        val chosen: Size? = if (resIdx == 1) {
-            vids.firstOrNull { Math.min(it.width, it.height) <= 1080 } ?: vids.firstOrNull()
+        // «Макс» = самый большой размер выбранного формата, «Норм» = самый большой не больше ~2,1 Мпикс
+        // (16:9 это 1920x1080, 4:3 это 1600x1200); в формате 20:9 один размер, самый большой
+        val chosen: Size? = if (resIdx == 1 && aspectMode != 2) {
+            vids.firstOrNull { it.width.toLong() * it.height <= 2_100_000L } ?: vids.firstOrNull()
         } else {
             vids.firstOrNull()
         }
@@ -1173,6 +1180,20 @@ class MainActivity : Activity() {
         previewSize = sizesFor(map.getOutputSizes(SurfaceTexture::class.java), previewMax).firstOrNull() ?: previewSize
         photoSize = sizesFor(map.getOutputSizes(ImageFormat.YUV_420_888), 13_000_000).firstOrNull() ?: photoSize
         log(aspectLabel() + ": превью $previewSize, видео $videoSize, фото $photoSize")
+        // один раз для камеры и формата: почему каждый размер видео подходит или нет
+        val key = cameraId + "/" + aspectMode
+        if (key != lastSizesLogKey) {
+            lastSizesLogKey = key
+            val all = sizesFor(map.getOutputSizes(MediaRecorder::class.java), Int.MAX_VALUE)
+            log("Размеры видео камеры " + cameraId + ", " + aspectLabel() + ": " + all.joinToString("; ") {
+                it.toString() + " " + when {
+                    it.width.toLong() * it.height > 3840L * 2160L -> "больше 4K, пропущен"
+                    badVideoSizes.contains(it.toString()) -> "ранее сбоил, пропущен"
+                    !encoderSupports(it.width, it.height) -> "кодер не поддерживает"
+                    else -> "подходит"
+                }
+            })
+        }
         runOnUiThread { btnRes.text = resLabel() }
         updateTransform()
     }
@@ -1300,6 +1321,7 @@ class MainActivity : Activity() {
         aspectMode = (aspectMode + 1) % 3
         btnAspect.text = aspectLabel()
         savePrefs()
+        updateModeUi()
         restartSession()
     }
 
@@ -1357,7 +1379,7 @@ class MainActivity : Activity() {
         sbStack.visibility = vis
         cbStackSum.visibility = vis
         btnRec.visibility = visVideo
-        btnRes.visibility = visVideo
+        btnRes.visibility = if (photo || aspectMode == 2) View.GONE else View.VISIBLE
         btnBitrate.visibility = visVideo
         updatePauseUi()
     }
