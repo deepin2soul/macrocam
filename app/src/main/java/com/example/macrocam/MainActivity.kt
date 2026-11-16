@@ -8,6 +8,7 @@ import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
@@ -33,12 +34,18 @@ import android.media.AudioFormat
 import android.media.AudioTrack
 import android.media.ExifInterface
 import android.media.MediaCodec
+import android.media.MediaCodecInfo
 import android.media.MediaCodecList
+import android.media.MediaFormat
+import android.media.MediaMuxer
 import android.media.MediaMetadataRetriever
 import android.media.Image
 import android.media.ImageReader
 import android.media.MediaRecorder
+import android.os.BatteryManager
 import android.os.Build
+import android.os.Environment
+import android.os.StatFs
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
@@ -78,6 +85,8 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.URLDecoder
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.io.FileInputStream
@@ -198,7 +207,7 @@ class MainActivity : Activity() {
     private var reopenPending = false
     private val restartRunnable = Runnable {
         reopenPending = false
-        if (!recording && !stacking && !opening) {
+        if (!recording && !stacking && !tlRunning && !opening) {
             log("Перезапуск камеры (экран " + texture.width + "x" + texture.height + ")")
             if (device != null) openById(cameraId) else tryAutoOpen()
         }
@@ -250,6 +259,41 @@ class MainActivity : Activity() {
     private var pfd: ParcelFileDescriptor? = null
     @Volatile private var recording = false
 
+    // ---------- таймлапс (режим 2) ----------
+    // доступные интервалы между кадрами, секунды
+    private val tlIntervals = intArrayOf(1, 2, 3, 4, 5, 6, 8, 10, 15, 20, 30, 45, 60, 90, 120, 180, 300, 600)
+    private val tlFps = 30            // частота кадров готового ролика (можно поставить 24)
+    private val tlMinBattery = 5      // авто-остановка при заряде не выше, %, если телефон не на зарядке
+    private val tlMinFreeMb = 300L    // авто-остановка, если свободного места меньше, МБ
+    private lateinit var sbTl: SeekBar
+    private lateinit var tvTl: TextView
+    private lateinit var cbTlJpeg: CheckBox
+    private lateinit var cbTlLock: CheckBox
+    private lateinit var btnTl: Button
+    @Volatile private var tlRunning = false
+    @Volatile private var tlLockEngaged = false
+    private var tlReader: ImageReader? = null
+    private var tlCodec: MediaCodec? = null
+    private var tlMuxer: MediaMuxer? = null
+    private var tlTrack = -1
+    private var tlMuxStarted = false
+    private var tlFrames = 0
+    private var tlW = 0
+    private var tlH = 0
+    private var tlIntervalMs = 5000L
+    private var tlStartUptime = 0L
+    private var tlShotIdx = 0L
+    @Volatile private var tlPendingSince = 0L
+    private var tlFailStreak = 0
+    private var tlSkipped = 0
+    private var tlSaveJpeg = false
+    private var tlJpegDir = ""
+    private var tlRotation = 0
+    private var tlInfo = ""
+    private var tlJpegExec: ExecutorService? = null
+    private val tlJpegPending = AtomicInteger(0)
+    private val tlTickToken = Any()
+
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     private fun mkBtn(label: String): Button {
@@ -298,6 +342,8 @@ class MainActivity : Activity() {
         btnPhoto = mkBtn("Фото")
         btnStack = mkBtn("Выдержка")
         btnRec = mkBtn("Видео")
+        btnTl = mkBtn("Таймлапс")
+        btnTl.visibility = View.GONE
         btnPause = mkBtn("Пауза")
         btnPause.visibility = View.GONE
         btnGallery = mkBtn("Галерея")
@@ -305,6 +351,7 @@ class MainActivity : Activity() {
         actions.orientation = LinearLayout.VERTICAL
         actions.addView(btnMode)
         actions.addView(btnRec)
+        actions.addView(btnTl)
         actions.addView(btnPause)
         actions.addView(btnPhoto)
         actions.addView(btnStack)
@@ -344,6 +391,10 @@ class MainActivity : Activity() {
         btnBitrate = mkBtn("Битрейт: 20 Мбит/с")
         btnRes = mkBtn("Разрешение: Норм")
         btnCodec = mkBtn("Кодек: H.265")
+        tvTl = mkTv("Интервал")
+        sbTl = mkSb(tlIntervals.size - 1, 4)
+        cbTlLock = mkCb("Блокировать экспозицию и баланс белого")
+        cbTlJpeg = mkCb("Сохранять и JPEG-кадры")
 
         val col = LinearLayout(this)
         col.orientation = LinearLayout.VERTICAL
@@ -355,6 +406,10 @@ class MainActivity : Activity() {
         col.addView(btnRes)
         col.addView(btnCodec)
         col.addView(btnBitrate)
+        col.addView(tvTl)
+        col.addView(sbTl)
+        col.addView(cbTlLock)
+        col.addView(cbTlJpeg)
         col.addView(cbFlip)
         col.addView(tvZoom)
         col.addView(sbZoom)
@@ -435,7 +490,10 @@ class MainActivity : Activity() {
         sbStack.progress = prefs.getInt("stack", 28)
         cbStackSum.isChecked = true
         sbBoost.progress = prefs.getInt("boost", 0)
-        mode = prefs.getInt("mode", 0).coerceIn(0, 1)
+        sbTl.progress = prefs.getInt("tlIdx", 4).coerceIn(0, tlIntervals.size - 1)
+        cbTlJpeg.isChecked = prefs.getBoolean("tlJpeg", false)
+        cbTlLock.isChecked = prefs.getBoolean("tlLock", false)
+        mode = prefs.getInt("mode", 0).coerceIn(0, 2)
         cameraId = prefs.getString("camId", "3") ?: "3"
         if (!camIds.contains(cameraId)) cameraId = "3"
         btnCam.text = "Камера: " + camLabel(cameraId)
@@ -468,7 +526,7 @@ class MainActivity : Activity() {
                 updateTransform()
                 // размер экрана изменился уже после запуска камеры (так бывает при возврате из галереи):
                 // перезапускаем камеру, когда размер устоится
-                if (device != null && !recording && !stacking && startedViewW > 0 &&
+                if (device != null && !recording && !stacking && !tlRunning && startedViewW > 0 &&
                     (w != startedViewW || h != startedViewH)
                 ) scheduleRestart(600)
             }
@@ -483,6 +541,9 @@ class MainActivity : Activity() {
         btnPhoto.setOnClickListener { takePhoto() }
         btnRec.setOnClickListener {
             if (recording) stopRecording() else startRecording()
+        }
+        btnTl.setOnClickListener {
+            if (tlRunning) handler.post { finishTimelapse(null, true) } else startTimelapse()
         }
 
         val seekListener = object : SeekBar.OnSeekBarChangeListener {
@@ -502,6 +563,7 @@ class MainActivity : Activity() {
         sbZoom.setOnSeekBarChangeListener(seekListener)
         sbStack.setOnSeekBarChangeListener(seekListener)
         sbBoost.setOnSeekBarChangeListener(seekListener)
+        sbTl.setOnSeekBarChangeListener(seekListener)
         btnStack.setOnClickListener { startStack() }
         btnMode.setOnClickListener { toggleMode() }
         btnPause.setOnClickListener { togglePause() }
@@ -513,7 +575,7 @@ class MainActivity : Activity() {
         val tapViews = listOf<View>(
             btnPanel, btnMode, btnPhoto, btnStack, btnRec,
             btnAspect, btnRes, btnCodec, btnNr, btnEdge, btnBitrate, cbExp, cbFocus, cbFlip, cbStackSum,
-            btnPause, btnGallery, btnTorch, btnSave, btnServer, btnCam
+            btnPause, btnGallery, btnTorch, btnSave, btnServer, btnCam, btnTl, cbTlJpeg, cbTlLock
         )
         for (v in tapViews) {
             v.setOnTouchListener { vv, ev ->
@@ -556,6 +618,8 @@ class MainActivity : Activity() {
             }
         }
         cbStackSum.setOnCheckedChangeListener { _, _ -> savePrefs() }
+        cbTlJpeg.setOnCheckedChangeListener { _, _ -> savePrefs() }
+        cbTlLock.setOnCheckedChangeListener { _, _ -> savePrefs(); updateRepeating() }
         btnAspect.setOnClickListener { toggleAspect() }
         btnRes.setOnClickListener { toggleResolution() }
         btnCodec.setOnClickListener { toggleCodec() }
@@ -612,6 +676,9 @@ class MainActivity : Activity() {
             .putBoolean("hevc", useHevc)
             .putInt("res", resIdx)
             .putInt("aspect", aspectMode)
+            .putInt("tlIdx", sbTl.progress)
+            .putBoolean("tlJpeg", cbTlJpeg.isChecked)
+            .putBoolean("tlLock", cbTlLock.isChecked)
             .apply()
     }
 
@@ -695,6 +762,11 @@ class MainActivity : Activity() {
     }
 
     private fun videoName(): String {
+        if (mode == 2) {
+            val iv = tlInterval()
+            videoInfo = shotInfo() + "; timelapse interval " + iv + " s, " + tlFps + " fps, speed x" + (iv * tlFps)
+            return "macro_" + stamp() + "_tl" + iv + "s_" + fileTag()
+        }
         videoInfo = shotInfo() + "; video stabilization " + (if (stabOn) "on" else "off")
         return "macro_" + stamp() + "_" + fileTag()
     }
@@ -907,7 +979,7 @@ class MainActivity : Activity() {
         if (useHevc) MediaRecorder.VideoEncoder.HEVC else MediaRecorder.VideoEncoder.H264
 
     private fun toggleCodec() {
-        if (recording || stacking) { log("Сначала остановите запись или долгую выдержку"); return }
+        if (recording || stacking || tlRunning) { log("Сначала остановите запись, долгую выдержку или таймлапс"); return }
         if (!useHevc && !hasHevcEncoder()) { log("Кодер H.265 на этом телефоне недоступен"); return }
         useHevc = !useHevc
         bitrateIdx = bitrateIdx.coerceIn(0, bitrates.size - 1)
@@ -973,6 +1045,7 @@ class MainActivity : Activity() {
         val dist = if (f < 0.01f) "бесконечность" else String.format("%.1f см", 100f / f)
         tvFocus.text = String.format("Фокус: %.1f дптр (%s)", f, dist)
         tvZoom.text = String.format("Зум: %.1fx", currentZoom())
+        tvTl.text = tlLabel()
     }
 
     private fun applyZoom(b: CaptureRequest.Builder) {
@@ -1072,6 +1145,16 @@ class MainActivity : Activity() {
                 b.set(CaptureRequest.CONTROL_AF_MODE, want)
             }
         }
+        // таймлапс: блокировка экспозиции и баланса белого, чтобы кадры не мигали;
+        // во время съёмки блокировка включается после короткого прогрева автоэкспозиции
+        val lock = mode == 2 && cbTlLock.isChecked && (!tlRunning || tlLockEngaged)
+        val cc = chars
+        if (cc?.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE) == true) {
+            b.set(CaptureRequest.CONTROL_AE_LOCK, lock && !cbExp.isChecked)
+        }
+        if (cc?.get(CameraCharacteristics.CONTROL_AWB_LOCK_AVAILABLE) == true) {
+            b.set(CaptureRequest.CONTROL_AWB_LOCK, lock)
+        }
     }
 
     // сессия с параметрами (стабилизация передаётся камере при создании сессии, как требуют многие телефоны)
@@ -1098,7 +1181,7 @@ class MainActivity : Activity() {
         val b = builder ?: return
         val s = session ?: return
         try {
-            applyControls(b, recording, !stacking)
+            applyControls(b, recording, !stacking && !tlRunning)
             s.setRepeatingRequest(b.build(), null, handler)
         } catch (e: Exception) {
             log("Ошибка обновления: $e")
@@ -1208,7 +1291,11 @@ class MainActivity : Activity() {
         }
         videoSize = videoCandidates.firstOrNull() ?: videoSize
         // превью: в режиме фото максимальное (фото берётся из превью), в режиме видео не больше размера видео
-        val previewMax = if (mode == 0) 13_000_000 else videoSize.width * videoSize.height
+        val previewMax = when (mode) {
+            0 -> 13_000_000
+            2 -> min(videoSize.width * videoSize.height, 2_100_000)
+            else -> videoSize.width * videoSize.height
+        }
         previewSize = sizesFor(map.getOutputSizes(SurfaceTexture::class.java), previewMax).firstOrNull() ?: previewSize
         photoSize = sizesFor(map.getOutputSizes(ImageFormat.YUV_420_888), 13_000_000).firstOrNull() ?: photoSize
         log(aspectLabel() + ": превью $previewSize, видео $videoSize, фото $photoSize")
@@ -1247,7 +1334,7 @@ class MainActivity : Activity() {
     }
 
     private fun toggleResolution() {
-        if (recording || stacking) { log("Сначала остановите запись или долгую выдержку"); return }
+        if (recording || stacking || tlRunning) { log("Сначала остановите запись, долгую выдержку или таймлапс"); return }
         resIdx = 1 - resIdx
         savePrefs()
         restartSession()
@@ -1349,7 +1436,7 @@ class MainActivity : Activity() {
     }
 
     private fun toggleAspect() {
-        if (recording || stacking) { log("Сначала остановите запись или долгую выдержку"); return }
+        if (recording || stacking || tlRunning) { log("Сначала остановите запись, долгую выдержку или таймлапс"); return }
         aspectMode = (aspectMode + 1) % 3
         btnAspect.text = aspectLabel()
         savePrefs()
@@ -1389,9 +1476,11 @@ class MainActivity : Activity() {
                 }
                 override fun onDisconnected(camera: CameraDevice) {
                     log("Отключена"); opening = false; device = null; camera.close()
+                    if (tlRunning) finishTimelapse("камера отключилась", false)
                 }
                 override fun onError(camera: CameraDevice, error: Int) {
                     log("Ошибка камеры, код $error"); opening = false; device = null; camera.close()
+                    if (tlRunning) finishTimelapse("ошибка камеры", false)
                 }
             }, handler)
         } catch (e: Exception) {
@@ -1404,13 +1493,23 @@ class MainActivity : Activity() {
         val photo = mode == 0
         val vis = if (photo) View.VISIBLE else View.GONE
         val visVideo = if (photo) View.GONE else View.VISIBLE
-        btnMode.text = if (photo) "Режим: Фото" else "Режим: Видео"
+        val tlVis = if (mode == 2) View.VISIBLE else View.GONE
+        btnMode.text = when (mode) {
+            0 -> "Режим: Фото"
+            1 -> "Режим: Видео"
+            else -> "Режим: Таймлапс"
+        }
+        btnTl.visibility = tlVis
+        tvTl.visibility = tlVis
+        sbTl.visibility = tlVis
+        cbTlLock.visibility = tlVis
+        cbTlJpeg.visibility = tlVis
         btnPhoto.visibility = vis
         btnStack.visibility = vis
         tvStack.visibility = vis
         sbStack.visibility = vis
         cbStackSum.visibility = vis
-        btnRec.visibility = visVideo
+        btnRec.visibility = if (mode == 1) View.VISIBLE else View.GONE
         btnRes.visibility = if (photo || aspectMode == 2) View.GONE else View.VISIBLE
         btnCodec.visibility = visVideo
         btnBitrate.visibility = visVideo
@@ -1922,7 +2021,7 @@ class MainActivity : Activity() {
     }
 
     private fun openGallery() {
-        if (recording || stacking) { log("Сначала остановите запись или долгую выдержку"); return }
+        if (recording || stacking || tlRunning) { log("Сначала остановите запись, долгую выдержку или таймлапс"); return }
         var u = lastMediaUri ?: prefs.getString("lastUri", null)?.let { Uri.parse(it) }
         var mime = lastMediaMime ?: prefs.getString("lastMime", null)
         if (u != null && !mediaAccessible(u)) {
@@ -1970,7 +2069,7 @@ class MainActivity : Activity() {
     }
 
     private fun switchCamera() {
-        if (recording || stacking) { log("Сначала остановите запись или долгую выдержку"); return }
+        if (recording || stacking || tlRunning) { log("Сначала остановите запись, долгую выдержку или таймлапс"); return }
         val i = camIds.indexOf(cameraId)
         cameraId = camIds[(i + 1) % camIds.size]
         btnCam.text = "Камера: " + camLabel(cameraId)
@@ -2021,9 +2120,9 @@ class MainActivity : Activity() {
     }
 
     private fun toggleMode() {
-        if (recording || stacking) { log("Сначала остановите запись или долгую выдержку"); return }
+        if (recording || stacking || tlRunning) { log("Сначала остановите запись, долгую выдержку или таймлапс"); return }
         if (rampActive) { log("Подождите, линза встаёт на место"); return }
-        mode = 1 - mode
+        mode = (mode + 1) % 3
         savePrefs()
         updateModeUi()
         restartSession()
@@ -2178,6 +2277,7 @@ class MainActivity : Activity() {
     private fun takePhoto() {
         if (device == null || session == null) { log("Сначала откройте камеру"); return }
         if (recording) { log("Во время записи фото недоступно"); return }
+        if (tlRunning) { log("Во время таймлапса фото недоступно"); return }
         if (stacking) { log("Идёт долгая выдержка"); return }
         if (rampActive) { log("Подождите, линза встаёт на место"); return }
         val info = shotInfo()
@@ -2210,7 +2310,9 @@ class MainActivity : Activity() {
         expSec: Double? = null,
         iso: Int? = null,
         distM: Double? = null,
-        tag: String? = null
+        tag: String? = null,
+        subDir: String? = null,
+        quiet: Boolean = false
     ) {
         var created: Uri? = null
         try {
@@ -2218,7 +2320,7 @@ class MainActivity : Activity() {
             val values = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, "$name.jpg")
                 put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/MacroCam")
+                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/MacroCam" + (if (subDir != null) "/" + subDir else ""))
                 put(MediaStore.Images.Media.IS_PENDING, 1)
             }
             val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
@@ -2266,12 +2368,14 @@ class MainActivity : Activity() {
             val done = ContentValues()
             done.put(MediaStore.Images.Media.IS_PENDING, 0)
             contentResolver.update(uri, done, null, null)
-            val desc = describeMedia(uri)
-            if (desc == null) {
-                log("Фото НЕ найдено в галерее после сохранения (запись о файле пропала)")
-            } else {
-                rememberLast(uri, "image/jpeg")
-                log("Фото сохранено: Pictures/MacroCam/$desc")
+            if (!quiet) {
+                val desc = describeMedia(uri)
+                if (desc == null) {
+                    log("Фото НЕ найдено в галерее после сохранения (запись о файле пропала)")
+                } else {
+                    rememberLast(uri, "image/jpeg")
+                    log("Фото сохранено: Pictures/MacroCam/$desc")
+                }
             }
         } catch (e: Exception) {
             log("Фото НЕ сохранено: $e")
@@ -2306,6 +2410,7 @@ class MainActivity : Activity() {
         val cam = device
         if (cam == null) { log("Сначала откройте камеру"); return }
         if (recording) { log("Остановите запись"); return }
+        if (tlRunning) { log("Идёт таймлапс"); return }
         if (rampActive) { log("Подождите, линза встаёт на место"); return }
         if (!cbExp.isChecked || isoRange == null || expRange == null) {
             log("Включите «Ручные ISO и выдержка» и задайте выдержку одного кадра")
@@ -2558,6 +2663,8 @@ class MainActivity : Activity() {
     }
 
     private fun startRecording() {
+        if (mode == 2) { log("В режиме таймлапса используйте кнопку «Таймлапс»"); return }
+        if (tlRunning) { log("Идёт таймлапс"); return }
         if (stacking) { log("Идёт долгая выдержка"); return }
         if (device == null) { log("Камера ещё не открыта"); return }
         if (rampActive) { log("Подождите, линза встаёт на место"); return }
@@ -2801,6 +2908,469 @@ class MainActivity : Activity() {
         if (!ok) markVideoSizeBad() else startPreview()
     }
 
+    // ---------- таймлапс ----------
+    // Каждые N секунд камера снимает кадр (YUV), кадр сразу уходит в кодер (H.265/H.264) и в MP4.
+    // Скорость ролика задаётся только частотой кадров: интервал × tlFps.
+
+    private fun tlInterval(): Int = tlIntervals[sbTl.progress.coerceIn(0, tlIntervals.size - 1)]
+
+    private fun tlLabel(): String {
+        val iv = tlInterval()
+        val speed = iv * tlFps
+        var hours = 1
+        var vid = 3600.0 * hours / speed
+        if (vid < 5.0) { hours = 8; vid = 3600.0 * hours / speed }
+        if (vid < 5.0) { hours = 24; vid = 3600.0 * hours / speed }
+        val vs = if (vid >= 10.0) String.format(Locale.US, "%.0f", vid) else String.format(Locale.US, "%.1f", vid)
+        val hs = when (hours) { 1 -> "1 час"; 8 -> "8 часов"; else -> "24 часа" }
+        return "Интервал: $iv с\n×$speed, $hs → $vs с видео"
+    }
+
+    // размер кадра: YUV-размер того же формата, ближайший к выбранному разрешению видео
+    private fun pickTimelapseSize(): Size? {
+        val map = streamMap ?: return null
+        val yuv = sizesFor(map.getOutputSizes(ImageFormat.YUV_420_888), Int.MAX_VALUE)
+            .filter {
+                it.width % 2 == 0 && it.height % 2 == 0 &&
+                    it.width.toLong() * it.height <= 3840L * 2160L &&
+                    encoderSupports(it.width, it.height)
+            }
+        if (yuv.isEmpty()) return null
+        val t = videoSize
+        return yuv.firstOrNull { it == t }
+            ?: yuv.firstOrNull { it.width.toLong() * it.height <= t.width.toLong() * t.height }
+            ?: yuv.last()
+    }
+
+    // причина для автоостановки: низкий заряд (если не на зарядке) или мало места
+    private fun tlStopReasonIfLow(): String? {
+        try {
+            val i = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            if (i != null) {
+                val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                val scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+                val status = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+                val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                    status == BatteryManager.BATTERY_STATUS_FULL
+                if (level >= 0 && scale > 0) {
+                    val pct = level * 100 / scale
+                    if (!charging && pct <= tlMinBattery) return "низкий заряд ($pct%)"
+                }
+            }
+        } catch (_: Exception) {
+        }
+        try {
+            val free = StatFs(Environment.getExternalStorageDirectory().path).availableBytes
+            if (free < tlMinFreeMb * 1024L * 1024L) return "мало места на телефоне (" + (free / 1048576L) + " МБ)"
+        } catch (_: Exception) {
+        }
+        return null
+    }
+
+    private fun tlUiIdle() {
+        btnTl.text = "Таймлапс"
+        btnTl.isEnabled = true
+        sbTl.isEnabled = true
+        cbTlJpeg.isEnabled = true
+    }
+
+    private fun releaseTlEncoder() {
+        try { tlCodec?.stop() } catch (_: Exception) {}
+        try { tlCodec?.release() } catch (_: Exception) {}
+        tlCodec = null
+        try { tlMuxer?.release() } catch (_: Exception) {}
+        tlMuxer = null
+        tlMuxStarted = false
+        try { tlReader?.close() } catch (_: Exception) {}
+        tlReader = null
+        cleanupRecorder() // закрывает и файловый дескриптор
+    }
+
+    private fun startTimelapse() {
+        val cam = device
+        if (cam == null) { log("Сначала откройте камеру"); return }
+        if (recording || stacking) { log("Сначала остановите запись или долгую выдержку"); return }
+        if (rampActive) { log("Подождите, линза встаёт на место"); return }
+        val sz = pickTimelapseSize()
+        if (sz == null) { log("Таймлапс: нет подходящего размера кадра"); return }
+        val low = tlStopReasonIfLow()
+        if (low != null) { log("Таймлапс не запущен: $low"); return }
+
+        tlW = sz.width
+        tlH = sz.height
+        tlIntervalMs = tlInterval() * 1000L
+        tlSaveJpeg = cbTlJpeg.isChecked
+        tlRotation = outputRotation()
+        tlFrames = 0
+        tlTrack = -1
+        tlMuxStarted = false
+        tlPendingSince = 0L
+        tlShotIdx = 0L
+        tlFailStreak = 0
+        tlSkipped = 0
+        tlLockEngaged = false
+        tlJpegDir = "Timelapse_" + stamp()
+        try {
+            val uri = createVideoEntry()
+            if (uri == null) { log("Не удалось создать файл видео в галерее"); return }
+            tlInfo = videoInfo ?: ""
+            val fd = contentResolver.openFileDescriptor(uri, "rw")
+            if (fd == null) { log("Не удалось открыть файл видео"); discardVideoEntry(); return }
+            pfd = fd
+
+            val mime = if (useHevc) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
+            val fmt = MediaFormat.createVideoFormat(mime, tlW, tlH)
+            fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+            fmt.setInteger(MediaFormat.KEY_BIT_RATE, bitrates[bitrateIdx] * 1_000_000)
+            fmt.setInteger(MediaFormat.KEY_FRAME_RATE, tlFps)
+            fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            val codec = MediaCodec.createEncoderByType(mime)
+            tlCodec = codec
+            codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            codec.start()
+            val mux = MediaMuxer(fd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            mux.setOrientationHint(tlRotation)
+            tlMuxer = mux
+
+            if (tlSaveJpeg) tlJpegExec = Executors.newSingleThreadExecutor()
+
+            val reader = ImageReader.newInstance(tlW, tlH, ImageFormat.YUV_420_888, 2)
+            reader.setOnImageAvailableListener({ r -> onTlImage(r) }, handler)
+            tlReader = reader
+            tlRunning = true
+            btnTl.text = "Стоп"
+            sbTl.isEnabled = false
+            cbTlJpeg.isEnabled = false
+
+            try { session?.close() } catch (_: Exception) {}
+            session = null
+            val st = texture.surfaceTexture!!
+            st.setDefaultBufferSize(previewSize.width, previewSize.height)
+            val pSurface = Surface(st)
+            previewSurface = pSurface
+            sessionHasRecorder = false
+            focusOverride = if (cbFocus.isChecked && minFocus > 0f) 0f else null
+            val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            b.addTarget(pSurface)
+            applyControls(b, false, false)
+            builder = b
+            cam.createCaptureSession(listOf(pSurface, reader.surface), object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(s: CameraCaptureSession) {
+                    session = s
+                    try {
+                        s.setRepeatingRequest(b.build(), null, handler)
+                    } catch (e: Exception) {
+                        log("Ошибка запроса: $e")
+                    }
+                    val iv = tlInterval()
+                    log("ТАЙМЛАПС: " + tlW + "x" + tlH + ", интервал " + iv + " с, " + tlFps + " к/с (×" + (iv * tlFps) +
+                        "), " + (if (useHevc) "H.265" else "H.264") + ", " + bitrates[bitrateIdx] + " Мбит/с" +
+                        (if (tlSaveJpeg) ", + JPEG-кадры" else ""))
+                    startFocusRamp { beginTimelapse() }
+                }
+                override fun onConfigureFailed(s: CameraCaptureSession) {
+                    log("Сессия таймлапса не настроилась")
+                    finishTimelapse("сессия не настроилась", true)
+                }
+            }, handler)
+        } catch (e: Throwable) {
+            log("Таймлапс: ошибка запуска: $e")
+            tlRunning = false
+            releaseTlEncoder()
+            discardVideoEntry()
+            tlUiIdle()
+            startPreview()
+        }
+    }
+
+    // прогрев автоэкспозиции, затем (если нужно) блокировка и первый кадр
+    private fun beginTimelapse() {
+        if (!tlRunning) return
+        val warm = if (cbExp.isChecked) 300L else 1500L
+        handler.postDelayed({
+            if (!tlRunning) return@postDelayed
+            tlLockEngaged = true
+            updateRepeating()
+            tlStartUptime = SystemClock.uptimeMillis() + 400L
+            tlShotIdx = 0L
+            scheduleTlTick()
+        }, warm)
+    }
+
+    private fun scheduleTlTick() {
+        if (!tlRunning) return
+        val at = tlStartUptime + tlShotIdx * tlIntervalMs
+        handler.postAtTime({ tlTick() }, tlTickToken, at)
+    }
+
+    private fun tlTick() {
+        if (!tlRunning) return
+        val low = tlStopReasonIfLow()
+        if (low != null) { finishTimelapse(low, true); return }
+        tlShotIdx++
+        scheduleTlTick() // следующий кадр по абсолютному времени, без накопления сдвига
+        val now = SystemClock.uptimeMillis()
+        if (tlPendingSince != 0L) {
+            if (now - tlPendingSince < 20_000L) {
+                tlSkipped++
+                if (tlSkipped == 1 || tlSkipped % 20 == 0) {
+                    log("Таймлапс: предыдущий кадр ещё обрабатывается, шаг пропущен ($tlSkipped)")
+                }
+                return
+            }
+            tlPendingSince = 0L
+        }
+        captureTlFrame()
+    }
+
+    private val tlCb = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureFailed(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            failure: CaptureFailure
+        ) {
+            tlPendingSince = 0L
+            if (tlRunning) log("Таймлапс: кадр не снят (код " + failure.reason + ")")
+        }
+    }
+
+    private fun captureTlFrame() {
+        val cam = device
+        val s = session
+        val reader = tlReader
+        if (cam == null || s == null || reader == null) {
+            finishTimelapse("камера недоступна", false)
+            return
+        }
+        try {
+            val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+            b.addTarget(reader.surface)
+            applyControls(b, false, false)
+            if (Build.VERSION.SDK_INT >= 30) b.set(CaptureRequest.CONTROL_ENABLE_ZSL, false)
+            tlPendingSince = SystemClock.uptimeMillis()
+            s.capture(b.build(), tlCb, handler)
+        } catch (e: Exception) {
+            tlPendingSince = 0L
+            tlFailStreak++
+            log("Таймлапс: ошибка запроса кадра: $e")
+            if (tlFailStreak >= 3) finishTimelapse("повторные ошибки камеры", true)
+        }
+    }
+
+    private fun onTlImage(r: ImageReader) {
+        val img: Image? = try { r.acquireNextImage() } catch (e: Exception) { null }
+        if (img == null) return
+        try {
+            if (!tlRunning) return
+            val n = tlFrames
+            encodeTlFrame(img, n)
+            if (tlSaveJpeg) queueTlJpeg(img, n)
+            tlFrames = n + 1
+            tlFailStreak = 0
+            val cnt = n + 1
+            if (cnt <= 3 || cnt % 20 == 0) {
+                log("Таймлапс: кадр " + cnt + ", ролик " + String.format(Locale.US, "%.1f", cnt / tlFps.toDouble()) + " с")
+            }
+            runOnUiThread { btnTl.text = "Стоп\nкадров: $cnt" }
+        } catch (e: Throwable) {
+            tlFailStreak++
+            log("Таймлапс: ошибка кадра: $e")
+            if (tlFailStreak >= 3) handler.post { finishTimelapse("повторные ошибки кодера", true) }
+        } finally {
+            tlPendingSince = 0L
+            try { img.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun encodeTlFrame(img: Image, n: Int) {
+        val codec = tlCodec ?: throw IllegalStateException("кодер не создан")
+        if (img.width != tlW || img.height != tlH) {
+            throw IllegalStateException("размер кадра " + img.width + "x" + img.height)
+        }
+        drainTl(false)
+        var idx = codec.dequeueInputBuffer(2_000_000L)
+        if (idx < 0) {
+            drainTl(false)
+            idx = codec.dequeueInputBuffer(2_000_000L)
+        }
+        if (idx < 0) throw java.io.IOException("кодер не принимает кадры")
+        val dst = codec.getInputImage(idx) ?: throw IllegalStateException("кодер не отдал буфер кадра")
+        copyImage(img, dst)
+        codec.queueInputBuffer(idx, 0, tlW * tlH * 3 / 2, n * 1_000_000L / tlFps, 0)
+        drainTl(false)
+    }
+
+    // построчное копирование кадра камеры во входной буфер кодера (учитывает шаги строк и пикселей)
+    private fun copyImage(src: Image, dst: Image) {
+        val w = src.width
+        val h = src.height
+        for (p in 0 until 3) {
+            val sp = src.planes[p]
+            val dp = dst.planes[p]
+            val pw = if (p == 0) w else w / 2
+            val ph = if (p == 0) h else h / 2
+            val sb = sp.buffer
+            val db = dp.buffer
+            val sRow = sp.rowStride
+            val dRow = dp.rowStride
+            val sPix = sp.pixelStride
+            val dPix = dp.pixelStride
+            if (sPix == 1 && dPix == 1) {
+                val line = ByteArray(pw)
+                for (y in 0 until ph) {
+                    sb.position(y * sRow)
+                    sb.get(line, 0, pw)
+                    db.position(y * dRow)
+                    db.put(line, 0, pw)
+                }
+            } else {
+                for (y in 0 until ph) {
+                    val so = y * sRow
+                    val d0 = y * dRow
+                    for (x in 0 until pw) db.put(d0 + x * dPix, sb.get(so + x * sPix))
+                }
+            }
+        }
+    }
+
+    // забираем готовые куски из кодера и пишем в MP4; untilEos = ждать конца потока
+    private fun drainTl(untilEos: Boolean) {
+        val codec = tlCodec ?: return
+        val info = MediaCodec.BufferInfo()
+        var guard = 0
+        while (true) {
+            val i = codec.dequeueOutputBuffer(info, if (untilEos) 100_000L else 0L)
+            if (i == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                if (!untilEos) return
+                if (++guard > 50) return
+                continue
+            }
+            if (i == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                val mux = tlMuxer ?: return
+                if (!tlMuxStarted) {
+                    tlTrack = mux.addTrack(codec.outputFormat)
+                    mux.start()
+                    tlMuxStarted = true
+                }
+                continue
+            }
+            if (i < 0) continue
+            guard = 0
+            val buf = codec.getOutputBuffer(i)
+            if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) info.size = 0
+            val mux = tlMuxer
+            if (info.size > 0 && buf != null && tlMuxStarted && mux != null) {
+                buf.position(info.offset)
+                buf.limit(info.offset + info.size)
+                mux.writeSampleData(tlTrack, buf, info)
+            }
+            codec.releaseOutputBuffer(i, false)
+            if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) return
+        }
+    }
+
+    // страховочный JPEG каждого кадра (если включена галочка); сжатие и запись идут в отдельном потоке
+    private fun queueTlJpeg(img: Image, n: Int) {
+        val exec = tlJpegExec ?: return
+        if (tlJpegPending.get() >= 4) {
+            log("JPEG: очередь переполнена, кадр " + (n + 1) + " пропущен")
+            return
+        }
+        val w = img.width
+        val h = img.height
+        val nv = ByteArray(w * h * 3 / 2)
+        val yp = img.planes[0]
+        val up = img.planes[1]
+        val vp = img.planes[2]
+        val yb = yp.buffer
+        for (y in 0 until h) {
+            yb.position(y * yp.rowStride)
+            yb.get(nv, y * w, w)
+        }
+        val ub = up.buffer
+        val vb = vp.buffer
+        var o = w * h
+        for (y in 0 until h / 2) {
+            for (x in 0 until w / 2) {
+                nv[o++] = vb.get(y * vp.rowStride + x * vp.pixelStride)
+                nv[o++] = ub.get(y * up.rowStride + x * up.pixelStride)
+            }
+        }
+        val rot = tlRotation
+        val info = tlInfo + "; timelapse frame " + (n + 1)
+        val dir = tlJpegDir
+        tlJpegPending.incrementAndGet()
+        exec.execute {
+            try {
+                val bos = ByteArrayOutputStream(w * h / 4)
+                YuvImage(nv, ImageFormat.NV21, w, h, null).compressToJpeg(Rect(0, 0, w, h), 95, bos)
+                savePhoto(bos.toByteArray(), rot, info, null, null, null, String.format(Locale.US, "tl%05d", n + 1), dir, true)
+            } catch (e: Throwable) {
+                log("JPEG кадра " + (n + 1) + ": " + e)
+            } finally {
+                tlJpegPending.decrementAndGet()
+            }
+        }
+    }
+
+    // Завершение: дописать кодер, закрыть MP4, проверить файл. Вызывается только в потоке камеры (handler).
+    private fun finishTimelapse(reason: String?, restore: Boolean) {
+        if (!tlRunning) return
+        tlRunning = false
+        handler.removeCallbacksAndMessages(tlTickToken)
+        tlLockEngaged = false
+        runOnUiThread { btnTl.isEnabled = false; btnTl.text = "Сохраняю…" }
+        if (reason != null) log("Таймлапс остановлен: $reason")
+        try { session?.stopRepeating() } catch (_: Exception) {}
+        try { session?.abortCaptures() } catch (_: Exception) {}
+
+        val frames = tlFrames
+        var ok = frames > 0
+        var why: String? = if (frames > 0) null else "не снято ни одного кадра"
+        val codec = tlCodec
+        try {
+            if (codec != null && frames > 0) {
+                val idx = codec.dequeueInputBuffer(2_000_000L)
+                if (idx >= 0) {
+                    codec.queueInputBuffer(idx, 0, 0, frames * 1_000_000L / tlFps, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                }
+                drainTl(true)
+            }
+        } catch (e: Throwable) {
+            ok = false
+            why = "кодер не завершил файл: $e"
+        }
+        try {
+            val mux = tlMuxer
+            if (mux != null && tlMuxStarted) mux.stop()
+        } catch (e: Throwable) {
+            ok = false
+            why = "muxer не смог завершить файл: $e"
+        }
+        releaseTlEncoder()
+        try { session?.close() } catch (_: Exception) {}
+        session = null
+
+        val ex = tlJpegExec
+        tlJpegExec = null
+        if (ex != null) {
+            ex.shutdown()
+            try { ex.awaitTermination(8, TimeUnit.SECONDS) } catch (_: Exception) {}
+        }
+        try {
+            finishVideoFile(ok, why)
+        } catch (e: Throwable) {
+            log("Видео: ошибка при завершении: $e")
+            discardVideoEntry()
+        }
+        if (frames > 0) {
+            log("Таймлапс: " + frames + " кадров, ролик ≈ " + String.format(Locale.US, "%.1f", frames / tlFps.toDouble()) + " с при " + tlFps + " к/с")
+            if (tlSaveJpeg) log("JPEG-кадры: Pictures/MacroCam/$tlJpegDir")
+        }
+        runOnUiThread { tlUiIdle() }
+        if (restore) startPreview()
+    }
+
     private fun hideSystemUi() {
         if (Build.VERSION.SDK_INT >= 30) {
             window.setDecorFitsSystemWindows(false)
@@ -2874,6 +3444,14 @@ class MainActivity : Activity() {
         if (stacking) {
             stacking = false
             cleanupStack()
+        }
+        if (tlRunning) {
+            // дописываем и закрываем MP4, пока камера ещё жива
+            val latch = CountDownLatch(1)
+            handler.post {
+                try { finishTimelapse("приложение свёрнуто", false) } finally { latch.countDown() }
+            }
+            try { latch.await(15, TimeUnit.SECONDS) } catch (_: InterruptedException) {}
         }
         if (recording) stopRecording()
         closeAll()
