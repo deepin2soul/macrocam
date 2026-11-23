@@ -13,6 +13,8 @@ import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
 import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
@@ -111,9 +113,9 @@ class MainActivity : Activity() {
     private val camIds = arrayOf("3", "0", "4")
     private lateinit var btnCam: Button
     @Volatile private var opening = false
-    private lateinit var sbIso: SeekBar
-    private lateinit var sbExp: SeekBar
-    private lateinit var sbFocus: SeekBar
+    private lateinit var sbIso: TickSeekBar
+    private lateinit var sbExp: TickSeekBar
+    private lateinit var sbFocus: TickSeekBar
     private lateinit var tvIso: TextView
     private lateinit var tvExp: TextView
     private lateinit var tvFocus: TextView
@@ -124,7 +126,7 @@ class MainActivity : Activity() {
     private lateinit var btnAspect: Button
     private lateinit var btnRes: Button
     private lateinit var btnCodec: Button
-    private lateinit var sbZoom: SeekBar
+    private lateinit var sbZoom: TickSeekBar
     private lateinit var tvZoom: TextView
     private lateinit var thread: HandlerThread
     private lateinit var handler: Handler
@@ -222,10 +224,10 @@ class MainActivity : Activity() {
     private val bitrates: IntArray get() = if (useHevc) intArrayOf(12, 25) else intArrayOf(20, 40)
     private var bitrateIdx = 0
     private var resIdx = 1 // 0 = макс, 1 = норм (1080p)
-    private lateinit var sbStack: SeekBar
+    private lateinit var sbStack: TickSeekBar
     private lateinit var tvStack: TextView
     private lateinit var cbStackSum: CheckBox
-    private lateinit var sbBoost: SeekBar
+    private lateinit var sbBoost: TickSeekBar
     private lateinit var tvBoost: TextView
 
     // долгая выдержка (наложение кадров)
@@ -258,6 +260,8 @@ class MainActivity : Activity() {
     private var recorder: MediaRecorder? = null
     private var pfd: ParcelFileDescriptor? = null
     @Volatile private var recording = false
+    @Volatile private var previewOff = false
+    private lateinit var btnPreview: Button
 
     // ---------- таймлапс (режим 2) ----------
     // доступные интервалы между кадрами, секунды
@@ -265,7 +269,7 @@ class MainActivity : Activity() {
     private val tlFps = 30            // частота кадров готового ролика (можно поставить 24)
     private val tlMinBattery = 5      // авто-остановка при заряде не выше, %, если телефон не на зарядке
     private val tlMinFreeMb = 300L    // авто-остановка, если свободного места меньше, МБ
-    private lateinit var sbTl: SeekBar
+    private lateinit var sbTl: TickSeekBar
     private lateinit var tvTl: TextView
     private lateinit var cbTlJpeg: CheckBox
     private lateinit var cbTlLock: CheckBox
@@ -318,8 +322,8 @@ class MainActivity : Activity() {
         return c
     }
 
-    private fun mkSb(maxValue: Int, progressValue: Int): SeekBar {
-        val sb = SeekBar(this)
+    private fun mkSb(maxValue: Int, progressValue: Int): TickSeekBar {
+        val sb = TickSeekBar(this)
         sb.max = maxValue
         sb.progress = progressValue
         return sb
@@ -347,6 +351,7 @@ class MainActivity : Activity() {
         btnPause = mkBtn("Пауза")
         btnPause.visibility = View.GONE
         btnGallery = mkBtn("Галерея")
+        btnPreview = mkBtn("Превью: вкл")
         val actions = LinearLayout(this)
         actions.orientation = LinearLayout.VERTICAL
         actions.addView(btnMode)
@@ -355,6 +360,7 @@ class MainActivity : Activity() {
         actions.addView(btnPause)
         actions.addView(btnPhoto)
         actions.addView(btnStack)
+        actions.addView(btnPreview)
         actions.addView(btnPanel)
         actions.addView(btnGallery)
         val actionsLp = FrameLayout.LayoutParams(wrap, wrap, Gravity.END or Gravity.CENTER_VERTICAL)
@@ -575,7 +581,7 @@ class MainActivity : Activity() {
         val tapViews = listOf<View>(
             btnPanel, btnMode, btnPhoto, btnStack, btnRec,
             btnAspect, btnRes, btnCodec, btnNr, btnEdge, btnBitrate, cbExp, cbFocus, cbFlip, cbStackSum,
-            btnPause, btnGallery, btnTorch, btnSave, btnServer, btnCam, btnTl, cbTlJpeg, cbTlLock
+            btnPause, btnGallery, btnTorch, btnSave, btnServer, btnCam, btnTl, btnPreview, cbTlJpeg, cbTlLock
         )
         for (v in tapViews) {
             v.setOnTouchListener { vv, ev ->
@@ -623,6 +629,7 @@ class MainActivity : Activity() {
         btnAspect.setOnClickListener { toggleAspect() }
         btnRes.setOnClickListener { toggleResolution() }
         btnCodec.setOnClickListener { toggleCodec() }
+        btnPreview.setOnClickListener { setPreviewEnabled(previewOff) }
         btnPanel.setOnClickListener {
             panel.visibility = if (panel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
         }
@@ -632,6 +639,7 @@ class MainActivity : Activity() {
             texture.rotation = if (checked) 180f else 0f
             savePrefs()
         }
+        applyTicks()
         updateLabels()
 
         val need = ArrayList<String>()
@@ -1178,6 +1186,7 @@ class MainActivity : Activity() {
     }
 
     private fun updateRepeating() {
+        if (previewOff) return
         val b = builder ?: return
         val s = session ?: return
         try {
@@ -1191,6 +1200,7 @@ class MainActivity : Activity() {
     // ---------- открытие камеры ----------
 
     private fun closeAll() {
+        clearPreviewOff()
         try { session?.close() } catch (_: Exception) {}
         try { device?.close() } catch (_: Exception) {}
         try { imageReader?.close() } catch (_: Exception) {}
@@ -1464,6 +1474,7 @@ class MainActivity : Activity() {
         closeAll()
         log("--- Открываю ID $id ---")
         readCharacteristics(id)
+        runOnUiThread { applyTicks() }
 
         try {
 
@@ -2229,7 +2240,7 @@ class MainActivity : Activity() {
                     session = s
                     sessionHasRecorder = hasRec
                     try {
-                        s.setRepeatingRequest(b.build(), null, handler)
+                        if (!previewOff) s.setRepeatingRequest(b.build(), null, handler)
                     } catch (e: Exception) {
                         log("Ошибка запроса: $e")
                     }
@@ -2279,6 +2290,7 @@ class MainActivity : Activity() {
         if (recording) { log("Во время записи фото недоступно"); return }
         if (tlRunning) { log("Во время таймлапса фото недоступно"); return }
         if (stacking) { log("Идёт долгая выдержка"); return }
+        if (previewOff) { log("Фото берётся из превью: включите превью и дождитесь кадра"); return }
         if (rampActive) { log("Подождите, линза встаёт на место"); return }
         val info = shotInfo()
         val tag = fileTag()
@@ -2411,6 +2423,7 @@ class MainActivity : Activity() {
         if (cam == null) { log("Сначала откройте камеру"); return }
         if (recording) { log("Остановите запись"); return }
         if (tlRunning) { log("Идёт таймлапс"); return }
+        clearPreviewOff()
         if (rampActive) { log("Подождите, линза встаёт на место"); return }
         if (!cbExp.isChecked || isoRange == null || expRange == null) {
             log("Включите «Ручные ISO и выдержка» и задайте выдержку одного кадра")
@@ -2667,6 +2680,7 @@ class MainActivity : Activity() {
         if (tlRunning) { log("Идёт таймлапс"); return }
         if (stacking) { log("Идёт долгая выдержка"); return }
         if (device == null) { log("Камера ещё не открыта"); return }
+        clearPreviewOff()
         if (rampActive) { log("Подождите, линза встаёт на место"); return }
         if (sessionHasRecorder && persistentSurface != null) startRecordingPersistent()
         else startRecordingLegacy()
@@ -2908,6 +2922,169 @@ class MainActivity : Activity() {
         if (!ok) markVideoSizeBad() else startPreview()
     }
 
+    // ---------- риски на ползунках ----------
+
+    private fun niceStep(span: Double, maxCount: Int): Double {
+        var mag = 1.0
+        while (true) {
+            for (m in doubleArrayOf(1.0, 2.0, 5.0)) {
+                val st = mag * m
+                if (span / st <= maxCount) return st
+            }
+            mag *= 10.0
+        }
+    }
+
+    // равномерная шкала: подписи на концах и на «круглых» значениях, короткие риски посередине
+    private fun linearTicks(lo: Double, hi: Double, maxP: Int, maxLabels: Int, fmt: (Double) -> String): List<TickSeekBar.Tick> {
+        val span = hi - lo
+        if (span <= 0.0) return emptyList()
+        val step = niceStep(span, maxLabels)
+        fun pos(v: Double): Int = Math.round((v - lo) / span * maxP).toInt().coerceIn(0, maxP)
+        val out = ArrayList<TickSeekBar.Tick>()
+        out.add(TickSeekBar.Tick(0, fmt(lo), 0))
+        out.add(TickSeekBar.Tick(maxP, fmt(hi), 0))
+        var k = Math.floor(lo / step).toLong() + 1
+        var guard = 0
+        while (k * step < hi - span * 0.02 && guard++ < 50) {
+            val v = k * step
+            if (v > lo + span * 0.02) out.add(TickSeekBar.Tick(pos(v), fmt(v), 1))
+            k++
+        }
+        var j = Math.floor(lo / (step / 2)).toLong() + 1
+        guard = 0
+        while (j * step / 2 < hi && guard++ < 100) {
+            if (j % 2L != 0L) {
+                val v = j * step / 2
+                if (v > lo && v < hi) out.add(TickSeekBar.Tick(pos(v), null, 2))
+            }
+            j++
+        }
+        return out
+    }
+
+    private fun expLabel(sec: Double): String =
+        if (sec >= 0.999) String.format(Locale.US, "%.0f с", sec) else "1/" + Math.round(1.0 / sec)
+
+    private fun applyTicks() {
+        // зум: логарифмическая шкала
+        val mz = maxZoom.toDouble()
+        if (mz > 1.05) {
+            val majors = doubleArrayOf(1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0)
+            val all = doubleArrayOf(1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 15.0, 20.0, 30.0, 50.0)
+            val l = ArrayList<TickSeekBar.Tick>()
+            for (z in all) {
+                if (z > mz * 1.001) continue
+                val p = Math.round(1000.0 * Math.log(z) / Math.log(mz)).toInt().coerceIn(0, 1000)
+                val isMajor = majors.any { it == z }
+                l.add(TickSeekBar.Tick(p, if (isMajor) String.format(Locale.US, "%.0f×", z) else null, 0))
+            }
+            sbZoom.setTicks(l)
+        } else sbZoom.setTicks(emptyList())
+
+        // ISO: равномерная шкала
+        val ir = isoRange
+        if (ir != null && ir.upper > ir.lower) {
+            sbIso.setTicks(linearTicks(ir.lower.toDouble(), ir.upper.toDouble(), 1000, 7) { it.toInt().toString() })
+        } else sbIso.setTicks(emptyList())
+
+        // выдержка: логарифмическая шкала, подписи примерно через 3 ступени
+        val er = expRange
+        if (er != null) {
+            val lo = er.lower.toDouble()
+            val hi = max(min(er.upper, maxFrameDuration), er.lower + 1).toDouble()
+            if (hi > lo) {
+                val stops = doubleArrayOf(
+                    1 / 8000.0, 1 / 4000.0, 1 / 2000.0, 1 / 1000.0, 1 / 500.0, 1 / 250.0, 1 / 125.0, 1 / 60.0,
+                    1 / 30.0, 1 / 15.0, 1 / 8.0, 1 / 4.0, 1 / 2.0, 1.0, 2.0, 4.0, 8.0, 15.0, 30.0, 60.0, 120.0
+                )
+                val prioOrder = doubleArrayOf(
+                    1 / 60.0, 1.0, 1 / 1000.0, 1 / 15.0, 1 / 250.0, 1 / 4.0, 4.0, 1 / 4000.0, 15.0, 30.0
+                )
+                val l = ArrayList<TickSeekBar.Tick>()
+                for (s in stops) {
+                    val ns = s * 1e9
+                    if (ns < lo * 0.999 || ns > hi * 1.001) continue
+                    val p = Math.round(1000.0 * Math.log(ns / lo) / Math.log(hi / lo)).toInt().coerceIn(0, 1000)
+                    val pi = prioOrder.indexOfFirst { it == s }
+                    l.add(TickSeekBar.Tick(p, if (pi >= 0) expLabel(s) else null, if (pi >= 0) pi else 99))
+                }
+                sbExp.setTicks(l)
+            } else sbExp.setTicks(emptyList())
+        } else sbExp.setTicks(emptyList())
+
+        // фокус: подписи в сантиметрах до предмета, справа бесконечность
+        val mf = minFocus.toDouble()
+        if (mf > 0.5) {
+            val l = ArrayList<TickSeekBar.Tick>()
+            l.add(TickSeekBar.Tick(1000, "∞", 0))
+            l.add(TickSeekBar.Tick(0, String.format(Locale.US, "%.0f", 100.0 / mf), 0))
+            val majors = intArrayOf(100, 50, 30, 20, 10, 5, 3)
+            val minors = intArrayOf(70, 40, 15, 7, 4)
+            for (dcm in majors) {
+                val f = 100.0 / dcm
+                if (f >= mf * 0.97) continue
+                l.add(TickSeekBar.Tick(Math.round(1000.0 * (1.0 - f / mf)).toInt().coerceIn(0, 1000), "$dcm", 1))
+            }
+            for (dcm in minors) {
+                val f = 100.0 / dcm
+                if (f >= mf * 0.97) continue
+                l.add(TickSeekBar.Tick(Math.round(1000.0 * (1.0 - f / mf)).toInt().coerceIn(0, 1000), null, 2))
+            }
+            sbFocus.setTicks(l)
+        } else sbFocus.setTicks(emptyList())
+
+        // цифровое усиление
+        val br = boostRange
+        if (br != null && br.upper > br.lower) {
+            sbBoost.setTicks(linearTicks(br.lower.toDouble(), br.upper.toDouble(), 1000, 6) { it.toInt().toString() + "%" })
+        } else sbBoost.setTicks(emptyList())
+
+        // долгая выдержка: 2..120 с
+        sbStack.setTicks(linearTicks(2.0, 120.0, 118, 6) { it.toInt().toString() })
+
+        // интервал таймлапса: по одной риске на каждое значение списка
+        val tl = ArrayList<TickSeekBar.Tick>()
+        val ends = intArrayOf(tlIntervals.first(), tlIntervals.last())
+        val labelled = intArrayOf(1, 5, 10, 30, 60, 120, 300, 600)
+        for (i in tlIntervals.indices) {
+            val v = tlIntervals[i]
+            val text = if (v >= 60) (v / 60).toString() + "м" else v.toString()
+            tl.add(TickSeekBar.Tick(i, if (labelled.contains(v)) text else null, if (ends.contains(v)) 0 else 1))
+        }
+        sbTl.setTicks(tl)
+    }
+
+    // ---------- превью вкл/выкл ----------
+    // Пока превью выключено, настройки меняются мгновенно и без очереди длинных кадров;
+    // при включении камера сразу работает с новыми настройками.
+
+    private fun setPreviewEnabled(on: Boolean) {
+        if (!on && (recording || stacking || tlRunning)) {
+            log("Во время съёмки превью выключить нельзя")
+            return
+        }
+        if (on == !previewOff) return
+        previewOff = !on
+        btnPreview.text = if (previewOff) "Превью: выкл" else "Превью: вкл"
+        if (previewOff) {
+            val s = session
+            try { s?.stopRepeating() } catch (_: Exception) {}
+            try { s?.abortCaptures() } catch (_: Exception) {}
+            log("Превью выключено: меняйте настройки, они применятся при включении")
+        } else {
+            updateRepeating()
+            log("Превью включено, камера набирает кадр с новыми настройками")
+        }
+    }
+
+    // съёмка сама включает превью (камере нужен рабочий поток кадров)
+    private fun clearPreviewOff() {
+        if (!previewOff) return
+        previewOff = false
+        runOnUiThread { btnPreview.text = "Превью: вкл" }
+    }
+
     // ---------- таймлапс ----------
     // Каждые N секунд камера снимает кадр (YUV), кадр сразу уходит в кодер (H.265/H.264) и в MP4.
     // Скорость ролика задаётся только частотой кадров: интервал × tlFps.
@@ -2995,6 +3172,7 @@ class MainActivity : Activity() {
         if (sz == null) { log("Таймлапс: нет подходящего размера кадра"); return }
         val low = tlStopReasonIfLow()
         if (low != null) { log("Таймлапс не запущен: $low"); return }
+        clearPreviewOff()
 
         tlW = sz.width
         tlH = sz.height
@@ -3630,3 +3808,72 @@ if (!pin) ask(); else startStream();
 poll(); setInterval(poll, 600); peak();
 </script></body></html>
 """
+
+
+// SeekBar с аккуратными рисками и подписями под дорожкой (только для ориентира, значения не «прилипают»)
+class TickSeekBar(context: Context) : SeekBar(context) {
+    class Tick(val progress: Int, val label: String? = null, val prio: Int = 0)
+
+    private var ticks: List<Tick> = emptyList()
+    private var labelOrder: List<Tick> = emptyList()
+    private val d = context.resources.displayMetrics.density
+    private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val tallLen = 7 * d
+    private val shortLen = 4 * d
+    private val textPx = android.util.TypedValue.applyDimension(
+        android.util.TypedValue.COMPLEX_UNIT_SP, 10f, context.resources.displayMetrics
+    )
+    private val extra = (tallLen + textPx + 6 * d).toInt()
+
+    init {
+        linePaint.color = Color.argb(190, 255, 255, 255)
+        linePaint.strokeWidth = if (d < 1f) 1f else d
+        textPaint.color = Color.argb(230, 210, 210, 210)
+        textPaint.textSize = textPx
+        textPaint.textAlign = Paint.Align.CENTER
+        setPadding(paddingLeft, paddingTop, paddingRight, paddingBottom + extra)
+    }
+
+    fun setTicks(list: List<Tick>) {
+        ticks = list
+        labelOrder = list.filter { it.label != null }.sortedWith(compareBy({ it.prio }, { it.progress }))
+        invalidate()
+    }
+
+    // x-координата центра бегунка при значении p
+    private fun xFor(p: Int): Float {
+        val scale = p.toFloat() / (if (max > 0) max else 1)
+        val tw = thumb?.intrinsicWidth ?: 0
+        val avail = width - paddingLeft - paddingRight - tw + thumbOffset * 2
+        return paddingLeft - thumbOffset + scale * avail + 0.5f + tw / 2f
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        if (ticks.isEmpty() || max <= 0) return
+        val y0 = (height - extra) + d
+        for (t in ticks) {
+            val x = xFor(t.progress)
+            canvas.drawLine(x, y0, x, y0 + (if (t.label != null) tallLen else shortLen), linePaint)
+        }
+        val baseline = y0 + tallLen + textPx * 0.9f + d
+        val drawn = ArrayList<FloatArray>()
+        for (t in labelOrder) {
+            val text = t.label ?: continue
+            val x = xFor(t.progress)
+            val w = textPaint.measureText(text)
+            var l = x - w / 2
+            var r = x + w / 2
+            if (l < 0f) { r -= l; l = 0f }
+            if (r > width) { l -= r - width; r = width.toFloat() }
+            var clash = false
+            for (q in drawn) {
+                if (l < q[1] + 4 * d && r > q[0] - 4 * d) { clash = true; break }
+            }
+            if (clash) continue
+            canvas.drawText(text, (l + r) / 2f, baseline, textPaint)
+            drawn.add(floatArrayOf(l, r))
+        }
+    }
+}
