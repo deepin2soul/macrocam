@@ -177,6 +177,10 @@ class MainActivity : Activity() {
     private var pendingDist: Double? = null
     private var pendingTag: String? = null
     private var stackFrameExpNs: Long = 0L
+    private var stackTotalNs = 0L          // заданная «долгая выдержка», нс
+    private var stackProbeDone = true      // false, пока не проверили, что камера дала такую выдержку
+    private var stackProbe = false
+    private var stackT0 = 0L
     private var mode = 0 // 0 = фото, 1 = видео
     private lateinit var btnMode: Button
     private lateinit var btnPhoto: Button
@@ -261,6 +265,8 @@ class MainActivity : Activity() {
     private var pfd: ParcelFileDescriptor? = null
     @Volatile private var recording = false
     @Volatile private var previewOff = false
+    private lateinit var previewCover: View
+    @Volatile private var coverPending = false
     private lateinit var btnPreview: Button
 
     // ---------- таймлапс (режим 2) ----------
@@ -339,6 +345,12 @@ class MainActivity : Activity() {
 
         texture = TextureView(this)
         root.addView(texture, FrameLayout.LayoutParams(match, match))
+
+        // чёрная заслонка: при включении превью стирает старый кадр, пока не придёт новый
+        previewCover = View(this)
+        previewCover.setBackgroundColor(Color.BLACK)
+        previewCover.visibility = View.GONE
+        root.addView(previewCover, FrameLayout.LayoutParams(match, match))
 
         // колонка кнопок съёмки, теперь справа, всегда на экране
         btnPanel = mkBtn("Панель")
@@ -538,6 +550,10 @@ class MainActivity : Activity() {
             }
             override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean = true
             override fun onSurfaceTextureUpdated(st: SurfaceTexture) {
+                if (coverPending) {
+                    coverPending = false
+                    previewCover.visibility = View.GONE
+                }
                 // самолечение: раз в 10 кадров проверяем, не устарела ли матрица превью
                 // (после возврата из галереи система могла сообщить неверный поворот или размер)
                 if (++frameCounter % 10 == 0 && transformKey() != appliedTransformKey) updateTransform()
@@ -730,7 +746,9 @@ class MainActivity : Activity() {
 
     private fun shotInfo(longFrames: Int = 0, frameExpNs: Long = 0L): String {
         val sb = StringBuilder("Exposure ")
-        if (longFrames > 0) {
+        if (longFrames == 1) {
+            sb.append(String.format(Locale.US, "%.1f s single long exposure", frameExpNs / 1e9))
+        } else if (longFrames > 1) {
             sb.append(String.format(Locale.US, "%.1f s total (%d frames x %s)",
                 longFrames * frameExpNs / 1e9, longFrames, fmtExp(frameExpNs)))
         } else {
@@ -751,7 +769,7 @@ class MainActivity : Activity() {
         val sb = StringBuilder()
         if (longFrames > 0) {
             sb.append("long").append(String.format(Locale.US, "%.0fs", longFrames * frameExpNs / 1e9))
-                .append("_").append(longFrames).append("x").append(tagExp(frameExpNs))
+            if (longFrames > 1) sb.append("_").append(longFrames).append("x").append(tagExp(frameExpNs))
         } else {
             sb.append("exp").append(if (cbExp.isChecked) tagExp(currentExp()) else "auto")
         }
@@ -961,7 +979,7 @@ class MainActivity : Activity() {
     private fun currentExp(): Long {
         val r = expRange ?: return 10_000_000L
         val lo = r.lower.toDouble()
-        val hi = max(min(r.upper, maxFrameDuration), r.lower + 1).toDouble()
+        val hi = max(5_000_000_000L, r.lower + 1).toDouble() // ползунок «Выдержка» доходит до 5 с
         return (lo * (hi / lo).pow(sbExp.progress / 1000.0)).toLong()
     }
 
@@ -1040,11 +1058,19 @@ class MainActivity : Activity() {
     private fun updateLabels() {
         tvIso.text = "ISO: " + currentIso()
         val exp = currentExp()
-        tvExp.text = if (exp >= 300_000_000L) String.format("Выдержка: %.2f с", exp / 1e9)
-        else "Выдержка: 1/" + (1_000_000_000.0 / exp).toInt() + " с"
+        val er0 = expRange
+        val devMax0 = if (er0 != null) min(er0.upper, maxFrameDuration) else Long.MAX_VALUE
+        val warn = if (exp > devMax0) String.format(Locale.US, " (камера даёт до %.1f с)", devMax0 / 1e9) else ""
+        tvExp.text = (if (exp >= 300_000_000L) String.format("Выдержка: %.2f с", exp / 1e9)
+        else "Выдержка: 1/" + (1_000_000_000.0 / exp).toInt() + " с") + warn
         val total = sbStack.progress + 2
-        val frames = min(300L, max(1L, total * 1_000_000_000L / exp))
-        tvStack.text = "Долгая выдержка: " + total + " с (кадров: " + frames + ")"
+        val er = expRange
+        val devMax = if (er != null) min(er.upper, maxFrameDuration) else 0L
+        tvStack.text = if (er == null || total * 1_000_000_000L <= devMax)
+            "Долгая выдержка: " + total + " с (один кадр)"
+        else
+            "Долгая выдержка: " + total + " с (один кадр; если камера не даст — кадры по " +
+                String.format(Locale.US, "%.1f", devMax / 1e9) + " с)"
         val br = boostRange
         if (br != null && br.upper > 100) {
             tvBoost.text = "Цифровое усиление: " + currentBoost() + "% (ISO ≈ " + (currentIso() * currentBoost() / 100) + ")"
@@ -2417,6 +2443,7 @@ class MainActivity : Activity() {
         if (stacking) {
             stackCancel = true
             log("Останавливаю, обработаю уже снятые кадры...")
+            if (stackCount == 0) handler.post { if (stacking && stackCount == 0) finishStack() }
             return
         }
         val cam = device
@@ -2426,14 +2453,19 @@ class MainActivity : Activity() {
         clearPreviewOff()
         if (rampActive) { log("Подождите, линза встаёт на место"); return }
         if (!cbExp.isChecked || isoRange == null || expRange == null) {
-            log("Включите «Ручные ISO и выдержка» и задайте выдержку одного кадра")
+            log("Включите «Ручные ISO и выдержка»: ISO берётся оттуда, выдержка — с ползунка «Долгая выдержка»")
             return
         }
-        val exp = currentExp()
+        // Долгая выдержка = ОДИН кадр с выдержкой, заданной ползунком «Долгая выдержка».
+        // Ползунок «Выдержка» вверху на неё не влияет. Если камера не даёт такую выдержку
+        // (урезает до своего максимума), приложение само переходит на сложение кадров.
         val totalNs = (sbStack.progress + 2) * 1_000_000_000L
-        var n = (totalNs / exp).toInt()
-        if (n < 1) n = 1
-        if (n > 300) { n = 300; log("Кадров слишком много, ограничено до 300") }
+        val devMax = min(expRange?.upper ?: totalNs, maxFrameDuration)
+        val exp = totalNs
+        val n = 1
+        stackTotalNs = totalNs
+        stackProbe = totalNs > devMax
+        stackProbeDone = !stackProbe
         stackW = photoSize.width
         stackH = photoSize.height
         try {
@@ -2451,13 +2483,13 @@ class MainActivity : Activity() {
         stackSubmitted = 0
         stackLogged = 0
         stackCancel = false
-        stackSum = true
+        stackSum = false // один кадр копится как есть; при переходе на сложение переключится
         try {
             val reader = ImageReader.newInstance(stackW, stackH, ImageFormat.YUV_420_888, 4)
             reader.setOnImageAvailableListener({ r -> onStackImage(r) }, handler)
             stackReader = reader
             stacking = true
-            runOnUiThread { btnStack.text = "Стоп 0/$n" }
+            runOnUiThread { btnStack.text = "Стоп 0/" + (stackTotalNs / 1_000_000_000L) + " с" }
 
             try { session?.close() } catch (_: Exception) {}
             session = null
@@ -2474,7 +2506,8 @@ class MainActivity : Activity() {
             cam.createCaptureSession(listOf(pSurface, reader.surface), object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     session = s
-                    log("Долгая выдержка: $n кадров, режим " + (if (stackSum) "сумма" else "среднее"))
+                    log("Долгая выдержка: один кадр " + fmtExp(stackFrameExpNs) +
+                        (if (stackProbe) " (проверяю, даёт ли камера такую выдержку)" else ""))
                     startFocusRamp { beginStackCaptures() }
                 }
                 override fun onConfigureFailed(s: CameraCaptureSession) {
@@ -2500,6 +2533,10 @@ class MainActivity : Activity() {
             result: TotalCaptureResult
         ) {
             val e = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+            if (!stackProbeDone) {
+                stackProbeDone = true
+                evaluateStackProbe(e ?: stackFrameExpNs)
+            }
             if (e != null && stackFrameExpNs > 0 && stackLogged < 3) {
                 val ratio = e.toDouble() / stackFrameExpNs
                 if (stackLogged == 0 || ratio < 0.9 || ratio > 1.1) {
@@ -2507,6 +2544,57 @@ class MainActivity : Activity() {
                     log("Выдержка кадра по данным камеры: " + fmtExp(e) + " (задано " + fmtExp(stackFrameExpNs) + ")")
                 }
             }
+        }
+
+        override fun onCaptureFailed(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            failure: CaptureFailure
+        ) {
+            if (!stacking) return
+            log("Долгая выдержка: кадр не снят (код " + failure.reason + ")")
+            finishStack()
+        }
+    }
+
+    // Первый кадр показал, какую выдержку камера реально дала.
+    private fun evaluateStackProbe(actual: Long) {
+        val want = stackFrameExpNs
+        if (actual >= want * 0.9) {
+            log("Камера приняла выдержку " + fmtExp(actual) + " одним кадром")
+            if (stacking && stackCount >= stackTarget) finishStack()
+            return
+        }
+        // камера урезала выдержку: набираем свет кадрами по её максимуму
+        val per = if (actual > 0L) actual else 1_000_000L
+        var n = Math.round(stackTotalNs.toDouble() / per).toInt()
+        if (n < 1) n = 1
+        if (n > 300) { n = 300; log("Кадров слишком много, ограничено до 300") }
+        log("Камера не даёт выдержку " + fmtExp(want) + " одним кадром (максимум " + fmtExp(actual) +
+            "). Снимаю " + n + " кадров и складываю")
+        stackFrameExpNs = per
+        stackTarget = n
+        stackSum = true
+        if (stackCount >= 1) {
+            // первый кадр уже накоплен «как есть», переводим его в линейную шкалу для сложения
+            val ya = yAcc
+            if (ya != null) for (i in ya.indices) ya[i] = lin[ya[i] and 0xFF]
+        }
+        val cnt = stackCount
+        runOnUiThread { btnStack.text = "Стоп $cnt/$n" }
+        if (stackCancel || cnt >= n) { finishStack(); return }
+        val more = min(3, n - stackSubmitted)
+        for (i in 0 until more) captureStackFrame()
+    }
+
+    // таймер на кнопке, пока идёт один длинный кадр
+    private val stackTicker = object : Runnable {
+        override fun run() {
+            if (!stacking || stackTarget != 1 || stackCancel) return
+            val el = ((SystemClock.uptimeMillis() - stackT0) / 1000L).toInt()
+            val tot = (stackTotalNs / 1_000_000_000L).toInt()
+            runOnUiThread { btnStack.text = "Стоп " + min(el, tot) + "/" + tot + " с" }
+            handler.postDelayed(this, 500L)
         }
     }
 
@@ -2516,8 +2604,10 @@ class MainActivity : Activity() {
         try { session?.stopRepeating() } catch (_: Exception) {}
         stackLastT = System.currentTimeMillis()
         log("Превью заморожено, идёт серия кадров")
-        val first = min(3, stackTarget)
+        val first = if (stackProbe) 1 else min(3, stackTarget)
         for (i in 0 until first) captureStackFrame()
+        stackT0 = SystemClock.uptimeMillis()
+        if (stackTarget == 1) handler.post(stackTicker)
     }
 
     private fun captureStackFrame() {
@@ -2530,6 +2620,9 @@ class MainActivity : Activity() {
             b.addTarget(reader.surface)
             applyControls(b, false, false)
             if (Build.VERSION.SDK_INT >= 30) b.set(CaptureRequest.CONTROL_ENABLE_ZSL, false)
+            // выдержка кадра серии (для одного длинного кадра это вся «долгая выдержка»)
+            b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, stackFrameExpNs)
+            b.set(CaptureRequest.SENSOR_FRAME_DURATION, max(stackFrameExpNs, 33_333_333L))
             s.capture(b.build(), stackCb, handler)
             stackSubmitted++
         } catch (e: Exception) {
@@ -2556,7 +2649,8 @@ class MainActivity : Activity() {
             log("Кадр " + cnt + "/" + tgt + ": +" + String.format(Locale.US, "%.2f", (now - stackLastT) / 1000.0) + " с")
         }
         stackLastT = now
-        runOnUiThread { btnStack.text = "Стоп $cnt/$tgt" }
+        if (!stackProbeDone) return // ждём данные камеры о реальной выдержке первого кадра
+        if (tgt > 1) runOnUiThread { btnStack.text = "Стоп $cnt/$tgt" }
         if (stackCancel || cnt >= tgt) finishStack()
         else if (stackSubmitted < tgt) captureStackFrame()
     }
@@ -2992,7 +3086,7 @@ class MainActivity : Activity() {
         val er = expRange
         if (er != null) {
             val lo = er.lower.toDouble()
-            val hi = max(min(er.upper, maxFrameDuration), er.lower + 1).toDouble()
+            val hi = max(5_000_000_000L, er.lower + 1).toDouble()
             if (hi > lo) {
                 val stops = doubleArrayOf(
                     1 / 8000.0, 1 / 4000.0, 1 / 2000.0, 1 / 1000.0, 1 / 500.0, 1 / 250.0, 1 / 125.0, 1 / 60.0,
@@ -3009,6 +3103,7 @@ class MainActivity : Activity() {
                     val pi = prioOrder.indexOfFirst { it == s }
                     l.add(TickSeekBar.Tick(p, if (pi >= 0) expLabel(s) else null, if (pi >= 0) pi else 99))
                 }
+                l.add(TickSeekBar.Tick(1000, "5 с", -1))
                 sbExp.setTicks(l)
             } else sbExp.setTicks(emptyList())
         } else sbExp.setTicks(emptyList())
@@ -3068,13 +3163,26 @@ class MainActivity : Activity() {
         previewOff = !on
         btnPreview.text = if (previewOff) "Превью: выкл" else "Превью: вкл"
         if (previewOff) {
+            // обрываем кадр, который сейчас экспонируется, а не дожидаемся его конца;
+            // делаем это в потоке камеры, чтобы не подвешивать интерфейс
             val s = session
-            try { s?.stopRepeating() } catch (_: Exception) {}
-            try { s?.abortCaptures() } catch (_: Exception) {}
-            log("Превью выключено: меняйте настройки, они применятся при включении")
+            handler.post {
+                try { s?.stopRepeating() } catch (_: Exception) {}
+                try { s?.abortCaptures() } catch (_: Exception) {}
+            }
+            log("Превью выключено, текущий кадр прерван. Меняйте настройки, они применятся при включении")
         } else {
-            updateRepeating()
-            log("Превью включено, камера набирает кадр с новыми настройками")
+            // стираем старый кадр: экран чёрный, пока камера не отдаст первый новый кадр
+            coverPending = true
+            previewCover.visibility = View.VISIBLE
+            texture.postDelayed({
+                if (coverPending) {
+                    coverPending = false
+                    previewCover.visibility = View.GONE
+                }
+            }, 15_000L)
+            handler.post { updateRepeating() }
+            log("Превью включено: накопление начато заново с новыми настройками")
         }
     }
 
