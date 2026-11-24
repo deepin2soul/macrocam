@@ -226,6 +226,13 @@ class MainActivity : Activity() {
     // два варианта битрейта (Мбит/с): H.265 экономнее при том же качестве
     private val bitrates: IntArray get() = if (useHevc) intArrayOf(12, 25) else intArrayOf(20, 40)
     private var bitrateIdx = 0
+    private val fpsChoices = intArrayOf(24, 30, 60, 120, 240) // какие частоты предлагать в видео
+    private var hsActive = false          // сессия сейчас скоростная (constrained high-speed), 120+ к/с
+    private var hsDisabled = false        // скоростная сессия не настроилась, дальше не пробуем
+    private var hsSizes: Set<String> = emptySet() // размеры, которые камера снимает в скоростном режиме
+    private var vFps = 30                              // выбранная частота кадров видео
+    private var fpsAvail: List<Int> = emptyList()      // что реально тянут камера, разрешение и кодер
+    private lateinit var btnFps: Button
     private var resIdx = 1 // 0 = макс, 1 = норм (1080p)
     private lateinit var sbStack: TickSeekBar
     private lateinit var tvStack: TextView
@@ -406,6 +413,7 @@ class MainActivity : Activity() {
         btnNr = mkBtn("Шумоподавление: авто")
         btnEdge = mkBtn("Контуры: авто")
         btnBitrate = mkBtn("Битрейт: 20 Мбит/с")
+        btnFps = mkBtn("Кадры: 30")
         btnRes = mkBtn("Разрешение: Норм")
         btnCodec = mkBtn("Кодек: H.265")
         tvTl = mkTv("Интервал")
@@ -423,6 +431,7 @@ class MainActivity : Activity() {
         col.addView(btnRes)
         col.addView(btnCodec)
         col.addView(btnBitrate)
+        col.addView(btnFps)
         col.addView(tvTl)
         col.addView(sbTl)
         col.addView(cbTlLock)
@@ -521,6 +530,7 @@ class MainActivity : Activity() {
         useHevc = prefs.getBoolean("hevc", true) && hasHevcEncoder()
         btnCodec.text = codecLabel()
         bitrateIdx = prefs.getInt("bitrate2", 0).coerceIn(0, bitrates.size - 1)
+        vFps = prefs.getInt("vfps", 30)
         btnBitrate.text = bitrateLabel()
         resIdx = prefs.getInt("res", 1).coerceIn(0, 1)
         usePersistent = (mode == 1)
@@ -596,7 +606,7 @@ class MainActivity : Activity() {
         val tapViews = listOf<View>(
             btnPanel, btnMode, btnPhoto, btnStack, btnRec,
             btnAspect, btnRes, btnCodec, btnNr, btnEdge, btnBitrate, cbExp, cbFocus, cbFlip, cbStackSum,
-            btnPause, btnGallery, btnTorch, btnSave, btnServer, btnCam, btnTl, btnPreview, cbTlJpeg, cbTlLock
+            btnPause, btnGallery, btnTorch, btnSave, btnServer, btnCam, btnTl, btnPreview, btnFps, cbTlJpeg, cbTlLock
         )
         for (v in tapViews) {
             v.setOnTouchListener { vv, ev ->
@@ -628,6 +638,21 @@ class MainActivity : Activity() {
             updateModeButtons()
             savePrefs()
             updateRepeating()
+        }
+        btnFps.setOnClickListener {
+            if (recording || stacking || tlRunning) { log("Сначала остановите запись, долгую выдержку или таймлапс"); return@setOnClickListener }
+            val av = fpsOptions()
+            if (av.size <= 1) {
+                log("Эта камера с выбранным разрешением и кодеком даёт только " + effectiveFps() + " к/с")
+                return@setOnClickListener
+            }
+            val cur = effectiveFps()
+            val next = av[(av.indexOf(cur) + 1) % av.size]
+            vFps = next
+            btnFps.text = fpsLabel()
+            savePrefs()
+            log("Частота кадров видео: " + next + " к/с" + (if (next > 60) " (скоростной режим: ручные ISO/выдержка не работают)" else ""))
+            if ((cur > 60) != (next > 60)) restartSession() else updateRepeating()
         }
         btnBitrate.setOnClickListener {
             if (recording) {
@@ -696,6 +721,7 @@ class MainActivity : Activity() {
             .putString("camId", cameraId)
             .putInt("edgeMode", edgeMode)
             .putInt("bitrate2", bitrateIdx)
+            .putInt("vfps", vFps)
             .putBoolean("hevc", useHevc)
             .putInt("res", resIdx)
             .putInt("aspect", aspectMode)
@@ -792,7 +818,7 @@ class MainActivity : Activity() {
             videoInfo = shotInfo() + "; timelapse interval " + iv + " s, " + tlFps + " fps, speed x" + (iv * tlFps)
             return "macro_" + stamp() + "_tl" + iv + "s_" + fileTag()
         }
-        videoInfo = shotInfo() + "; video stabilization " + (if (stabOn) "on" else "off")
+        videoInfo = shotInfo() + "; video " + activeFps() + " fps; video stabilization " + (if (stabOn) "on" else "off")
         return "macro_" + stamp() + "_" + fileTag()
     }
 
@@ -1142,6 +1168,7 @@ class MainActivity : Activity() {
     }
 
     private fun applyControls(b: CaptureRequest.Builder, record: Boolean, stab: Boolean = true) {
+        if (hsActive && mode == 1) { applyHsControls(b); return }
         applyZoom(b)
         applyProcessing(b)
         if (stab) applyStabilization(b)
@@ -1150,13 +1177,18 @@ class MainActivity : Activity() {
             b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
             b.set(CaptureRequest.SENSOR_SENSITIVITY, currentIso())
             b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exp)
-            b.set(CaptureRequest.SENSOR_FRAME_DURATION, max(exp, 33_333_333L))
+            val minDur = if (mode == 1) 1_000_000_000L / activeFps() else 33_333_333L
+            b.set(CaptureRequest.SENSOR_FRAME_DURATION, max(exp, minDur))
             val br = boostRange
             if (br != null && br.upper > 100) {
                 b.set(CaptureRequest.CONTROL_POST_RAW_SENSITIVITY_BOOST, currentBoost())
             }
         } else {
             b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+        }
+        if (mode == 1) {
+            val fr = fpsRangeFor(activeFps())
+            if (fr != null) b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fr)
         }
         // builder переиспользуется, поэтому выключение нужно задавать явно, иначе «фонарик» остаётся в запросе
         b.set(
@@ -1212,7 +1244,7 @@ class MainActivity : Activity() {
         val s = session ?: return
         try {
             applyControls(b, recording, !stacking && !tlRunning)
-            s.setRepeatingRequest(b.build(), null, handler)
+            setRepeatingAny(s, b)
         } catch (e: Exception) {
             log("Ошибка обновления: $e")
         }
@@ -1228,6 +1260,7 @@ class MainActivity : Activity() {
         try { persistentSurface?.release() } catch (_: Exception) {}
         persistentSurface = null
         sessionHasRecorder = false
+        hsActive = false
         rampToken++
         rampActive = false
         focusOverride = null
@@ -1249,6 +1282,7 @@ class MainActivity : Activity() {
         try {
             val c = cm.getCameraCharacteristics(id)
             chars = c
+            hsDisabled = false
             isoRange = c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
             expRange = c.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
             minFocus = c.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
@@ -1344,9 +1378,102 @@ class MainActivity : Activity() {
                 }
             })
         }
-        runOnUiThread { btnRes.text = resLabel() }
+        refreshFpsOptions()
+        if (isHsMode() && previewSize != videoSize) previewSize = videoSize
+        runOnUiThread { btnRes.text = resLabel(); btnFps.text = fpsLabel() }
         updateTransform()
     }
+
+    // ---------- частота кадров видео ----------
+
+    // диапазон AE для нужной частоты: лучше точный [f,f], иначе самый «жёсткий» из подходящих
+    private fun fpsRangeFor(f: Int): android.util.Range<Int>? {
+        val rs = chars?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: return null
+        return rs.firstOrNull { it.lower == f && it.upper == f }
+            ?: rs.filter { it.upper == f }.maxByOrNull { it.lower }
+            ?: rs.filter { it.lower <= f && it.upper >= f }.maxByOrNull { it.lower }
+    }
+
+    // то же для скоростного режима (120/240 к/с): диапазон обязан быть из списка камеры для этого размера
+    private fun hsRangeFor(f: Int): android.util.Range<Int>? {
+        val rs = (try { streamMap?.getHighSpeedVideoFpsRangesFor(videoSize) } catch (_: Exception) { null }) ?: return null
+        return rs.firstOrNull { it.lower == f && it.upper == f }
+            ?: rs.filter { it.upper == f }.maxByOrNull { it.lower }
+    }
+
+    // какие частоты потянут камера (диапазон и длительность кадра для текущего размера) и кодер
+    private fun refreshFpsOptions() {
+        val map = streamMap
+        val mime = if (useHevc) "video/hevc" else "video/avc"
+        hsSizes = try {
+            map?.highSpeedVideoSizes?.map { it.toString() }?.toSet() ?: emptySet()
+        } catch (_: Exception) { emptySet() }
+        val list = ArrayList<Int>()
+        for (f in fpsChoices) {
+            if (f > 60) {
+                if (!hsSizes.contains(videoSize.toString()) || hsRangeFor(f) == null) continue
+            } else {
+                if (fpsRangeFor(f) == null) continue
+                try {
+                    val minDur = map?.getOutputMinFrameDuration(MediaRecorder::class.java, videoSize) ?: 0L
+                    if (minDur > 0L && minDur > 1_000_000_000L / f * 1.03) continue
+                } catch (_: Exception) {}
+            }
+            var codecOk = true
+            try {
+                codecOk = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { ci ->
+                    ci.isEncoder && ci.supportedTypes.contains(mime) &&
+                        ci.getCapabilitiesForType(mime).videoCapabilities
+                            .areSizeAndRateSupported(videoSize.width, videoSize.height, f.toDouble())
+                }
+            } catch (_: Exception) {}
+            if (codecOk) list.add(f)
+        }
+        if (list.isEmpty()) list.add(30)
+        fpsAvail = list
+        log("Частоты видео для " + videoSize + ": " + list.joinToString(", ") + " к/с" +
+            (if (hsSizes.isNotEmpty()) " (скоростной режим: " + hsSizes.joinToString(", ") + ")" else ""))
+    }
+
+    // что реально можно выбрать сейчас: скоростные частоты только с постоянной поверхностью записи
+    private fun fpsOptions(): List<Int> =
+        fpsAvail.filter { it <= 60 || (usePersistent && !hsDisabled) }
+
+    private fun effectiveFps(): Int {
+        val av = fpsOptions()
+        if (av.isEmpty()) return 30
+        if (av.contains(vFps)) return vFps
+        return av.lastOrNull { it <= vFps } ?: av.first()
+    }
+
+    private fun isHsMode(): Boolean =
+        mode == 1 && usePersistent && !hsDisabled && effectiveFps() > 60 && hsSizes.contains(videoSize.toString())
+
+    // частота, с которой реально работает текущая сессия
+    private fun activeFps(): Int = if (hsActive) effectiveFps() else min(effectiveFps(), 60)
+
+    // в скоростной сессии камера принимает мало параметров: зум, автоэкспозиция, непрерывный автофокус, диапазон FPS
+    private fun applyHsControls(b: CaptureRequest.Builder) {
+        applyZoom(b)
+        b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+        val fr = hsRangeFor(effectiveFps())
+        if (fr != null) b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fr)
+        val afModes = chars?.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
+        if (afModes != null && afModes.contains(CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)) {
+            b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+        }
+    }
+
+    private fun setRepeatingAny(s: CameraCaptureSession, b: CaptureRequest.Builder) {
+        if (s is CameraConstrainedHighSpeedCaptureSession) {
+            val list = s.createHighSpeedRequestList(b.build())
+            s.setRepeatingBurst(list, null, handler)
+        } else {
+            s.setRepeatingRequest(b.build(), null, handler)
+        }
+    }
+
+    private fun fpsLabel(): String = "Кадры: " + effectiveFps() + " к/с"
 
     private fun resLabel(): String =
         "Разрешение: " + (if (resIdx == 0) "Макс " else "Норм ") + videoSize.width + "x" + videoSize.height
@@ -1532,6 +1659,7 @@ class MainActivity : Activity() {
             else -> "Режим: Таймлапс"
         }
         btnTl.visibility = tlVis
+        btnFps.visibility = if (mode == 1) View.VISIBLE else View.GONE
         tvTl.visibility = tlVis
         sbTl.visibility = tlVis
         cbTlLock.visibility = tlVis
@@ -2238,37 +2366,48 @@ class MainActivity : Activity() {
             try { session?.close() } catch (_: Exception) {}
             session = null
             sessionHasRecorder = false
+            hsActive = false
+            var ps: Surface? = null
+            if (usePersistent) ps = createPersistentSurface()
+            // 120/240 к/с: скоростная сессия (только превью и запись, размер превью = размеру видео)
+            val hsNow = ps != null && isHsMode()
+            hsActive = hsNow
             val st = texture.surfaceTexture!!
-            st.setDefaultBufferSize(previewSize.width, previewSize.height)
+            val bufSize = if (hsNow) videoSize else previewSize
+            st.setDefaultBufferSize(bufSize.width, bufSize.height)
             val surface = Surface(st)
             previewSurface = surface
             startedViewW = texture.width
             startedViewH = texture.height
             focusOverride = if (cbFocus.isChecked && minFocus > 0f) 0f else null
-            val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            val b = cam.createCaptureRequest(if (hsNow) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW)
             b.addTarget(surface)
             applyControls(b, false)
             builder = b
             previewBuilder = b
             val targets = ArrayList<Surface>()
             targets.add(surface)
-            var ps: Surface? = null
-            if (usePersistent) ps = createPersistentSurface()
             if (ps != null) targets.add(ps)
             val hasRec = ps != null
-            createSessionWithParams(cam, targets, b.build(), object : CameraCaptureSession.StateCallback() {
+            val cb = object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     session = s
                     sessionHasRecorder = hasRec
                     try {
-                        if (!previewOff) s.setRepeatingRequest(b.build(), null, handler)
+                        if (!previewOff) setRepeatingAny(s, b)
                     } catch (e: Exception) {
                         log("Ошибка запроса: $e")
                     }
                     startFocusRamp { }
                 }
                 override fun onConfigureFailed(s: CameraCaptureSession) {
-                    if (hasRec) {
+                    if (hsNow) {
+                        log("Скоростной режим " + effectiveFps() + " к/с не настроился, возвращаю обычный")
+                        hsDisabled = true
+                        hsActive = false
+                        runOnUiThread { btnFps.text = fpsLabel() }
+                        startPreview()
+                    } else if (hasRec) {
                         log("Сессия с видео не настроилась, запись будет с перенастройкой камеры")
                         usePersistent = false
                         try { persistentSurface?.release() } catch (_: Exception) {}
@@ -2278,7 +2417,14 @@ class MainActivity : Activity() {
                         log("Сессия не настроилась")
                     }
                 }
-            })
+            }
+            if (hsNow) {
+                log("Скоростной режим " + effectiveFps() + " к/с, " + videoSize +
+                    (if (cbExp.isChecked) ": ручные ISO и выдержка здесь не работают, камера в авто" else ""))
+                cam.createConstrainedHighSpeedCaptureSession(targets, cb, handler)
+            } else {
+                createSessionWithParams(cam, targets, b.build(), cb)
+            }
         } catch (e: Exception) {
             log("Ошибка превью: $e")
         }
@@ -2754,7 +2900,7 @@ class MainActivity : Activity() {
         builder = pb
         try {
             applyControls(pb, false)
-            sess.setRepeatingRequest(pb.build(), null, handler)
+            setRepeatingAny(sess, pb)
         } catch (e: Exception) {
             log("Ошибка возврата превью: $e")
         }
@@ -2792,7 +2938,7 @@ class MainActivity : Activity() {
             }
             r.setVideoEncoder(videoEncoderType())
             r.setVideoEncodingBitRate(br)
-            r.setVideoFrameRate(30)
+            r.setVideoFrameRate(activeFps())
             r.setVideoSize(videoSize.width, videoSize.height)
             r.setOrientationHint(outputRotation())
             r.setInputSurface(ps)
@@ -2804,7 +2950,7 @@ class MainActivity : Activity() {
             rb.addTarget(ps)
             applyControls(rb, true)
             builder = rb
-            sess.setRepeatingRequest(rb.build(), null, handler)
+            setRepeatingAny(sess, rb)
             r.start()
             recording = true
             recordingPersistent = true
@@ -2887,10 +3033,10 @@ class MainActivity : Activity() {
                     t.setVideoEncoder(videoEncoderType())
                     val fixed = bitrates[bitrateIdx]
                     val br = if (fixed > 0) fixed * 1_000_000
-                    else (sz.width.toLong() * sz.height * 30 * 0.15).toLong()
+                    else (sz.width.toLong() * sz.height * activeFps() * 0.15).toLong()
                         .coerceIn(8_000_000L, 50_000_000L).toInt()
                     t.setVideoEncodingBitRate(br)
-                    t.setVideoFrameRate(30)
+                    t.setVideoFrameRate(activeFps())
                     t.setVideoSize(sz.width, sz.height)
                     t.setOrientationHint(outputRotation())
                     t.prepare()
