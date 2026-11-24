@@ -1434,7 +1434,15 @@ class MainActivity : Activity() {
                             .areSizeAndRateSupported(videoSize.width, videoSize.height, f.toDouble())
                 }
             } catch (_: Exception) {}
-            if (codecOk) list.add(f) else why.add("$f: кодер " + (if (useHevc) "H.265" else "H.264") + " не берёт")
+            if (codecOk) {
+                list.add(f)
+            } else if (f > 60 && hsProfileFps() >= f) {
+                // кодер по справочнику «не берёт», но у камеры есть скоростной профиль записи: пробуем
+                list.add(f)
+                why.add("$f: кодер не подтвердил, принято по скоростному профилю камеры (пробуем)")
+            } else {
+                why.add("$f: кодер " + (if (useHevc) "H.265" else "H.264") + " не берёт")
+            }
         }
         if (list.isEmpty()) list.add(30)
         fpsAvail = list
@@ -1446,6 +1454,21 @@ class MainActivity : Activity() {
                 "; скоростные для " + videoSize + ": " +
                 (if (hsSizes.contains(videoSize.toString())) (map?.getHighSpeedVideoFpsRangesFor(videoSize)?.joinToString() ?: "нет") else "размер не скоростной"))
         } catch (_: Exception) {}
+    }
+
+    // частота из скоростного профиля камеры (CamcorderProfile) для текущего размера, 0 если профиля нет
+    private fun hsProfileFps(): Int {
+        val id = cameraId.toIntOrNull() ?: return 0
+        val q = when (videoSize.height) {
+            2160 -> CamcorderProfile.QUALITY_HIGH_SPEED_2160P
+            1080 -> CamcorderProfile.QUALITY_HIGH_SPEED_1080P
+            720 -> CamcorderProfile.QUALITY_HIGH_SPEED_720P
+            480 -> CamcorderProfile.QUALITY_HIGH_SPEED_480P
+            else -> return 0
+        }
+        return try {
+            if (CamcorderProfile.hasProfile(id, q)) (CamcorderProfile.get(id, q)?.videoFrameRate ?: 0) else 0
+        } catch (_: Exception) { 0 }
     }
 
     // что реально можно выбрать сейчас: скоростные частоты только с постоянной поверхностью записи
@@ -2939,8 +2962,8 @@ class MainActivity : Activity() {
             val r = MediaRecorder()
             r.setOnErrorListener { _, what, extra -> log("Ошибка рекордера: what=$what extra=$extra") }
             r.setOnInfoListener { _, what, extra -> log("Рекордер: info what=$what extra=$extra") }
-            val withAudio = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-            if (withAudio) r.setAudioSource(MediaRecorder.AudioSource.MIC) else log("Нет разрешения на микрофон, запись без звука")
+            val withAudio = !hsActive && checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+            if (withAudio) r.setAudioSource(MediaRecorder.AudioSource.MIC) else log(if (hsActive) "Скоростной режим: запись без звука" else "Нет разрешения на микрофон, запись без звука")
             r.setVideoSource(MediaRecorder.VideoSource.SURFACE)
             r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             r.setOutputFile(fd.fileDescriptor)
@@ -2980,6 +3003,12 @@ class MainActivity : Activity() {
             btnRec.text = "Видео"
             updatePauseUi()
             restorePreview()
+            if (hsActive) {
+                // скоростная запись не получилась: отключаем скоростной режим и пересоздаём обычную сессию
+                hsDisabled = true
+                log("Запись " + effectiveFps() + " к/с не удалась, скоростной режим отключён")
+                restartSession()
+            }
         }
     }
 
