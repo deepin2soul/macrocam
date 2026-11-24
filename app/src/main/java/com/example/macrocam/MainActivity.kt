@@ -231,6 +231,8 @@ class MainActivity : Activity() {
     private var hsDisabled = false        // скоростная сессия не настроилась, дальше не пробуем
     private var hsCamFor = ""            // для какой камеры hsDisabled актуален
     private var hsToken = 0               // номер попытки скоростной сессии (для сторожевого таймера)
+    @Volatile private var hsRecPending = false // скоростная запись подготовлена, ждём перезапуска камеры
+    @Volatile private var hsRecording = false  // идёт скоростная запись (сессия constrained high-speed)
     private var hsSizes: Set<String> = emptySet() // размеры, которые камера снимает в скоростном режиме
     private var vFps = 30                              // выбранная частота кадров видео
     private var fpsAvail: List<Int> = emptyList()      // что реально тянут камера, разрешение и кодер
@@ -1535,7 +1537,6 @@ class MainActivity : Activity() {
             try { session?.close() } catch (_: Exception) {}
             session = null
             computeSizes()
-            if (isHsMode()) { reopenCamera(); return }
             startPreview()
         } else {
             computeSizes()
@@ -1686,10 +1687,12 @@ class MainActivity : Activity() {
                 }
                 override fun onDisconnected(camera: CameraDevice) {
                     log("Отключена"); opening = false; device = null; camera.close()
+                    if (hsRecPending) failHsRecord("камера отключилась", false)
                     if (tlRunning) finishTimelapse("камера отключилась", false)
                 }
                 override fun onError(camera: CameraDevice, error: Int) {
                     log("Ошибка камеры, код $error"); opening = false; device = null; camera.close()
+                    if (hsRecPending) failHsRecord("ошибка камеры $error", false)
                     if (tlRunning) finishTimelapse("ошибка камеры", false)
                 }
             }, handler)
@@ -2413,6 +2416,7 @@ class MainActivity : Activity() {
 
     private fun startPreview() {
         val cam = device ?: return
+        if (hsRecPending) { startHsRecordSession(cam); return }
         try {
             try { session?.close() } catch (_: Exception) {}
             session = null
@@ -2421,7 +2425,7 @@ class MainActivity : Activity() {
             var ps: Surface? = null
             if (usePersistent) ps = createPersistentSurface()
             // 120/240 к/с: скоростная сессия (только превью и запись, размер превью = размеру видео)
-            val hsNow = ps != null && isHsMode()
+            val hsNow = false // превью всегда обычное; скоростная сессия создаётся только на время записи
             hsActive = hsNow
             val st = texture.surfaceTexture!!
             val bufSize = if (hsNow) videoSize else previewSize
@@ -2961,6 +2965,8 @@ class MainActivity : Activity() {
         if (device == null) { log("Камера ещё не открыта"); return }
         clearPreviewOff()
         if (rampActive) { log("Подождите, линза встаёт на место"); return }
+        if (hsRecPending || hsRecording) return
+        if (isHsMode()) { startRecordingHs(); return }
         if (sessionHasRecorder && persistentSurface != null) startRecordingPersistent()
         else startRecordingLegacy()
     }
@@ -3081,6 +3087,143 @@ class MainActivity : Activity() {
         if (!recordingPersistent) startPreview()
     }
 
+    // ---------- скоростная запись (120/240 к/с) ----------
+    // Превью всегда обычное. По нажатию «Видео» готовим рекордер, перезапускаем камеру,
+    // создаём скоростную сессию [превью + поверхность рекордера] и сразу пишем.
+    // После «Стоп» камера снова перезапускается в обычное превью.
+
+    private fun startRecordingHs() {
+        val fps = effectiveFps()
+        try {
+            val uri = createVideoEntry()
+            if (uri == null) { log("Не удалось создать файл видео в галерее"); return }
+            videoInfo = shotInfo() + "; video " + fps + " fps (high-speed); video stabilization off"
+            val fd = contentResolver.openFileDescriptor(uri, "w")
+            if (fd == null) { log("Не удалось открыть файл видео"); discardVideoEntry(); return }
+            pfd = fd
+            val br = bitrates[bitrateIdx] * 1_000_000
+            val r = MediaRecorder()
+            r.setOnErrorListener { _, what, extra -> log("Ошибка рекордера: what=$what extra=$extra") }
+            r.setOnInfoListener { _, what, extra -> log("Рекордер: info what=$what extra=$extra") }
+            r.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            r.setOutputFile(fd.fileDescriptor)
+            r.setVideoEncoder(videoEncoderType())
+            r.setVideoEncodingBitRate(br)
+            r.setVideoFrameRate(fps)
+            r.setVideoSize(videoSize.width, videoSize.height)
+            r.setOrientationHint(outputRotation())
+            r.prepare()
+            recorder = r
+            hsRecPending = true
+            log("Скоростная запись " + fps + " к/с, " + videoSize + ", " + (br / 1_000_000) + " Мбит/с, " +
+                (if (useHevc) "H.265" else "H.264") + ": перезапускаю камеру в скоростной режим")
+            runOnUiThread { btnRec.text = "Стоп" }
+            reopenCamera()
+        } catch (e: Exception) {
+            log("Скоростной рекордер не подготовился: $e")
+            cleanupRecorder()
+            discardVideoEntry()
+            hsDisabled = true
+            runOnUiThread { btnRec.text = "Видео"; btnFps.text = fpsLabel() }
+        }
+    }
+
+    private fun startHsRecordSession(cam: CameraDevice) {
+        hsRecPending = false
+        val r = recorder
+        if (r == null) { failHsRecord("рекордер потерян", true); return }
+        try {
+            val st = texture.surfaceTexture!!
+            st.setDefaultBufferSize(videoSize.width, videoSize.height)
+            val pv = Surface(st)
+            previewSurface = pv
+            val rs = r.surface
+            hsActive = true
+            val rb = cam.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+            rb.addTarget(pv)
+            rb.addTarget(rs)
+            applyHsControls(rb)
+            builder = rb
+            previewBuilder = rb
+            val tok = ++hsToken
+            val cb = object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(s: CameraCaptureSession) {
+                    session = s
+                    try {
+                        setRepeatingAny(s, rb)
+                        r.start()
+                        recording = true
+                        hsRecording = true
+                        hsToken++
+                        runOnUiThread { btnRec.text = "Стоп" }
+                        updatePauseUi()
+                        log("ЗАПИСЬ ИДЁТ (скоростная): " + effectiveFps() + " к/с, " + videoSize)
+                    } catch (e: Exception) {
+                        failHsRecord("старт не удался: $e", true)
+                    }
+                }
+                override fun onConfigureFailed(s: CameraCaptureSession) {
+                    failHsRecord("скоростная сессия не настроилась", true)
+                }
+            }
+            handler.postDelayed({
+                if (tok == hsToken && !hsRecording && hsActive) failHsRecord("камера не ответила за 6 с", true)
+            }, 6000L)
+            cam.createConstrainedHighSpeedCaptureSession(listOf(pv, rs), cb, handler)
+        } catch (e: Exception) {
+            failHsRecord("ошибка создания сессии: $e", true)
+        }
+    }
+
+    private fun failHsRecord(why: String, reopen: Boolean) {
+        log("Скоростная запись не удалась (" + why + "), скоростной режим отключён")
+        hsToken++
+        hsRecPending = false
+        hsRecording = false
+        recording = false
+        hsActive = false
+        hsDisabled = true
+        cleanupRecorder()
+        discardVideoEntry()
+        runOnUiThread { btnRec.text = "Видео"; btnFps.text = fpsLabel() }
+        updatePauseUi()
+        if (reopen) reopenCamera()
+    }
+
+    private fun stopRecordingHs() {
+        var ok = true
+        var why: String? = null
+        try {
+            try { session?.stopRepeating() } catch (_: Exception) {}
+            try { session?.abortCaptures() } catch (_: Exception) {}
+            try {
+                recorder?.stop()
+            } catch (e: Exception) {
+                ok = false
+                why = "рекордер не смог завершить файл: $e"
+            }
+            cleanupRecorder()
+            finishVideoFile(ok, why)
+        } catch (e: Throwable) {
+            log("Видео: ошибка при завершении записи: $e")
+            discardVideoEntry()
+            ok = false
+        } finally {
+            recording = false
+            hsRecording = false
+            hsActive = false
+            runOnUiThread { btnRec.text = "Видео"; btnFps.text = fpsLabel() }
+            updatePauseUi()
+        }
+        if (!ok) {
+            // сбой скоростной записи не должен помечать размер сбойным для обычного видео
+            hsDisabled = true
+            log("Скоростной режим отключён после сбоя записи")
+        }
+        reopenCamera() // выход из скоростной сессии только через перезапуск камеры
+    }
+
     private fun startRecordingLegacy() {
         val cam = device
         if (cam == null) { log("Сначала откройте камеру"); return }
@@ -3182,6 +3325,7 @@ class MainActivity : Activity() {
     }
 
     private fun stopRecording() {
+        if (hsRecording) { stopRecordingHs(); return }
         if (recordingPersistent) { stopRecordingPersistent(); return }
         var ok = true
         var why: String? = null
