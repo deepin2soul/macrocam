@@ -1409,15 +1409,22 @@ class MainActivity : Activity() {
             map?.highSpeedVideoSizes?.map { it.toString() }?.toSet() ?: emptySet()
         } catch (_: Exception) { emptySet() }
         val list = ArrayList<Int>()
+        val why = ArrayList<String>()
         for (f in fpsChoices) {
             if (f > 60) {
-                if (!hsSizes.contains(videoSize.toString()) || hsRangeFor(f) == null) continue
+                if (!hsSizes.contains(videoSize.toString())) { why.add("$f: размер не скоростной"); continue }
+                if (hsRangeFor(f) == null) { why.add("$f: нет диапазона"); continue }
             } else {
-                if (fpsRangeFor(f) == null) continue
+                if (fpsRangeFor(f) == null) { why.add("$f: нет диапазона AE"); continue }
+                var tooSlow = false
                 try {
                     val minDur = map?.getOutputMinFrameDuration(MediaRecorder::class.java, videoSize) ?: 0L
-                    if (minDur > 0L && minDur > 1_000_000_000L / f * 1.03) continue
+                    if (minDur > 0L && minDur > 1_000_000_000L / f * 1.03) {
+                        tooSlow = true
+                        why.add(f.toString() + ": кадр для этого размера не короче " + (minDur / 1_000_000L) + " мс")
+                    }
                 } catch (_: Exception) {}
+                if (tooSlow) continue
             }
             var codecOk = true
             try {
@@ -1427,12 +1434,18 @@ class MainActivity : Activity() {
                             .areSizeAndRateSupported(videoSize.width, videoSize.height, f.toDouble())
                 }
             } catch (_: Exception) {}
-            if (codecOk) list.add(f)
+            if (codecOk) list.add(f) else why.add("$f: кодер " + (if (useHevc) "H.265" else "H.264") + " не берёт")
         }
         if (list.isEmpty()) list.add(30)
         fpsAvail = list
         log("Частоты видео для " + videoSize + ": " + list.joinToString(", ") + " к/с" +
             (if (hsSizes.isNotEmpty()) " (скоростной режим: " + hsSizes.joinToString(", ") + ")" else ""))
+        if (why.isNotEmpty()) log("Не предложены: " + why.joinToString("; "))
+        try {
+            log("Диапазоны AE камеры: " + (chars?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.joinToString() ?: "нет") +
+                "; скоростные для " + videoSize + ": " +
+                (if (hsSizes.contains(videoSize.toString())) (map?.getHighSpeedVideoFpsRangesFor(videoSize)?.joinToString() ?: "нет") else "размер не скоростной"))
+        } catch (_: Exception) {}
     }
 
     // что реально можно выбрать сейчас: скоростные частоты только с постоянной поверхностью записи
