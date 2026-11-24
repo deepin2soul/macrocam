@@ -229,6 +229,8 @@ class MainActivity : Activity() {
     private val fpsChoices = intArrayOf(24, 30, 60, 120, 240) // какие частоты предлагать в видео
     private var hsActive = false          // сессия сейчас скоростная (constrained high-speed), 120+ к/с
     private var hsDisabled = false        // скоростная сессия не настроилась, дальше не пробуем
+    private var hsCamFor = ""            // для какой камеры hsDisabled актуален
+    private var hsToken = 0               // номер попытки скоростной сессии (для сторожевого таймера)
     private var hsSizes: Set<String> = emptySet() // размеры, которые камера снимает в скоростном режиме
     private var vFps = 30                              // выбранная частота кадров видео
     private var fpsAvail: List<Int> = emptyList()      // что реально тянут камера, разрешение и кодер
@@ -1282,7 +1284,7 @@ class MainActivity : Activity() {
         try {
             val c = cm.getCameraCharacteristics(id)
             chars = c
-            hsDisabled = false
+            if (hsCamFor != id) { hsDisabled = false; hsCamFor = id }
             isoRange = c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
             expRange = c.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
             minFocus = c.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
@@ -1517,12 +1519,23 @@ class MainActivity : Activity() {
         "Разрешение: " + (if (resIdx == 0) "Макс " else "Норм ") + videoSize.width + "x" + videoSize.height
 
     // перезапуск сессии под новые параметры (формат, разрешение, режим), чтобы запись потом стартовала без перенастройки
+    // Вход в скоростную сессию и выход из неё делаем только с переоткрытием камеры:
+    // на этом телефоне прямая замена сессии вешает камеру (Error waiting to drain / timeout).
+    private fun reopenCamera() {
+        log("Смена типа сессии камеры: перезапускаю камеру")
+        closeAll()
+        btnFps.postDelayed({ tryAutoOpen() }, 600)
+    }
+
     private fun restartSession() {
+        val wasHs = hsActive
         usePersistent = (mode == 1)
         if (device != null) {
+            if (wasHs) { reopenCamera(); return }
             try { session?.close() } catch (_: Exception) {}
             session = null
             computeSizes()
+            if (isHsMode()) { reopenCamera(); return }
             startPreview()
         } else {
             computeSizes()
@@ -2433,8 +2446,17 @@ class MainActivity : Activity() {
                     sessionHasRecorder = hasRec
                     try {
                         if (!previewOff) setRepeatingAny(s, b)
+                        if (hsNow) log("Скоростная сессия настроена, превью пошло на " + effectiveFps() + " к/с")
                     } catch (e: Exception) {
                         log("Ошибка запроса: $e")
+                        if (hsNow) {
+                            log("Скоростной режим отклонил запрос, отключаю его и перезапускаю камеру")
+                            hsDisabled = true
+                            hsActive = false
+                            runOnUiThread { btnFps.text = fpsLabel() }
+                            reopenCamera()
+                            return
+                        }
                     }
                     startFocusRamp { }
                 }
@@ -2444,7 +2466,7 @@ class MainActivity : Activity() {
                         hsDisabled = true
                         hsActive = false
                         runOnUiThread { btnFps.text = fpsLabel() }
-                        startPreview()
+                        reopenCamera()
                     } else if (hasRec) {
                         log("Сессия с видео не настроилась, запись будет с перенастройкой камеры")
                         usePersistent = false
@@ -2459,6 +2481,17 @@ class MainActivity : Activity() {
             if (hsNow) {
                 log("Скоростной режим " + effectiveFps() + " к/с, " + videoSize +
                     (if (cbExp.isChecked) ": ручные ISO и выдержка здесь не работают, камера в авто" else ""))
+                // сторожевой таймер: если камера за 6 с так и не ответила, отключаем скоростной режим
+                val tok = ++hsToken
+                handler.postDelayed({
+                    if (tok == hsToken && hsActive && session == null) {
+                        log("Скоростная сессия не ответила за 6 с: отключаю скоростной режим и перезапускаю камеру")
+                        hsDisabled = true
+                        hsActive = false
+                        runOnUiThread { btnFps.text = fpsLabel() }
+                        reopenCamera()
+                    }
+                }, 6000L)
                 cam.createConstrainedHighSpeedCaptureSession(targets, cb, handler)
             } else {
                 createSessionWithParams(cam, targets, b.build(), cb)
